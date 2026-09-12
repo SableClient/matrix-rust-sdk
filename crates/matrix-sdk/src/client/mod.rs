@@ -137,6 +137,9 @@ pub use self::builder::{ClientBuildError, ClientBuilder, sanitize_server_name};
 #[cfg(feature = "experimental-search")]
 use crate::search_index::SearchIndex;
 
+/// Capacity of the channel behind [`Client::subscribe_to_all_room_updates`].
+const ROOM_UPDATES_CHANNEL_CAPACITY: usize = 256;
+
 #[cfg(not(target_family = "wasm"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[cfg(target_family = "wasm")]
@@ -492,9 +495,11 @@ impl ClientInner {
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
             room_update_channels: Default::default(),
-            // A single `RoomUpdates` is sent once per sync, so we assume that 32 is sufficient
-            // ballast for all observers to catch up.
-            room_updates_sender: broadcast::Sender::new(32),
+            // A `RoomUpdates` is sent once per sync response, and a client runs more than one
+            // sliding sync connection, so this measures responses rather than room activity. The
+            // only consumer that matters answers `Lagged` by dropping every room's event cache, so
+            // the ballast has to cover a burst of back-to-back responses, not an average.
+            room_updates_sender: broadcast::Sender::new(ROOM_UPDATES_CHANNEL_CAPACITY),
             respect_login_well_known,
             well_known_lookup_disabled: StdRwLock::new(well_known_lookup_disabled),
             sync_beat: event_listener::Event::new(),
