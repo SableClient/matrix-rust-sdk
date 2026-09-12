@@ -191,6 +191,15 @@ impl Client {
         // A sliding sync without lists lands here with no rooms, and broadcasting those
         // evicts real updates. Ignore errors when there are no receivers.
         if !rooms.is_empty() {
+            debug!(
+                joined = rooms.joined.len(),
+                invited = rooms.invited.len(),
+                knocked = rooms.knocked.len(),
+                left = rooms.left.len(),
+                queued = self.inner.room_updates_sender.len(),
+                receivers = self.inner.room_updates_sender.receiver_count(),
+                "Broadcasting a `RoomUpdates`"
+            );
             let _ = self.inner.room_updates_sender.send(rooms.clone());
         }
 
