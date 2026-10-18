@@ -2064,6 +2064,22 @@ impl Room {
         Ok(())
     }
 
+    /// Share any shareable E2EE history of this room with the given user, as
+    /// per [MSC4268].
+    ///
+    /// This is what [`Room::invite_user_by_id`] does before it sends the
+    /// invite. Recipients only accept the resulting key bundle from their
+    /// inviter, shortly after joining.
+    ///
+    /// Does nothing if cross-signing is not set up or if the room's current
+    /// history visibility does not allow sharing.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn share_history_with(&self, user_id: &UserId) -> Result<()> {
+        shared_room_history::share_room_history(self, user_id.to_owned()).await
+    }
+
     /// Invite the specified user by `UserId` to this room.
     ///
     /// # Arguments
