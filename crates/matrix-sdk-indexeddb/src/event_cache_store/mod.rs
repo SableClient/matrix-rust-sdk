@@ -664,13 +664,12 @@ impl EventCacheStore for IndexeddbEventCacheStore {
     ) -> Result<Vec<Event>, IndexeddbEventCacheStoreError> {
         let _timer = timer!("method");
 
-        // TODO: Make this more efficient so we don't load all events and filter
-        // them here. We should instead only load the relevant events.
-
         let transaction = self.transaction(&[keys::EVENTS], IdbTransactionMode::Readonly)?;
-        transaction
-            .get_room_events(room_id)
-            .await
+        let events = match session_id {
+            Some(session_id) => transaction.get_events_by_session(room_id, session_id).await,
+            None => transaction.get_room_events(room_id).await,
+        };
+        events
             .map(|mut vec| {
                 vec.dedup_by(|a, b| {
                     if let (Some(a), Some(b)) = (a.event_id(), b.event_id()) {
