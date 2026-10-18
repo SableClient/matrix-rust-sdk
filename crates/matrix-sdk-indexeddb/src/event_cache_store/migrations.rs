@@ -21,10 +21,10 @@ use thiserror::Error;
 
 /// The current version and keys used in the database.
 pub mod current {
-    use super::{Version, v9};
+    use super::{Version, v10};
 
-    pub const VERSION: Version = Version::V9;
-    pub use v9::keys;
+    pub const VERSION: Version = Version::V10;
+    pub use v10::keys;
 }
 
 /// Opens a connection to the IndexedDB database and takes care of upgrading it
@@ -70,6 +70,8 @@ pub enum Version {
     V8 = 8,
     /// Version 9 of the database, for details see [`v9`].
     V9 = 9,
+    /// Version 10 of the database, for details see [`v10`].
+    V10 = 10,
 }
 
 impl Version {
@@ -85,7 +87,8 @@ impl Version {
             Self::V6 => v6::upgrade(transaction).map(Some),
             Self::V7 => v7::upgrade(transaction).map(Some),
             Self::V8 => v8::upgrade(transaction).map(Some),
-            Self::V9 => Ok(None),
+            Self::V9 => v9::upgrade(transaction).map(Some),
+            Self::V10 => Ok(None),
         }
     }
 }
@@ -109,6 +112,7 @@ impl TryFrom<u32> for Version {
             7 => Ok(Version::V7),
             8 => Ok(Version::V8),
             9 => Ok(Version::V9),
+            10 => Ok(Version::V10),
             v => Err(UnknownVersionError(v)),
         }
     }
@@ -573,5 +577,89 @@ pub mod v9 {
             .with_unique(true)
             .build()?;
         Ok(())
+    }
+
+    /// Upgrade database from `v9` to `v10`, emptying the store because existing
+    /// events have no key in the new session index.
+    pub fn upgrade(transaction: &Transaction<'_>) -> Result<Version, Error> {
+        empty_event_cache(transaction)?;
+        v10::add_session_index_to_events_object_store(transaction)?;
+        Ok(Version::V10)
+    }
+}
+
+pub mod v10 {
+    use indexed_db_futures::Build;
+
+    use super::*;
+
+    pub mod keys {
+        // Re-use all the same keys from `v9`.
+        pub use super::v9::keys::*;
+
+        pub const EVENTS_SESSION: &str = "events_session";
+        pub const EVENTS_SESSION_KEY_PATH: &str = "session";
+    }
+
+    /// Add a new index to the events object store which tracks the Megolm
+    /// session used to encrypt the corresponding event.
+    ///
+    /// The key for this index is composed of the room id, the session id and
+    /// the event id of the event. Events without a session id are not visible
+    /// through this index.
+    pub fn add_session_index_to_events_object_store(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), Error> {
+        let events = transaction.object_store(keys::EVENTS)?;
+        let _ = events
+            .create_index(keys::EVENTS_SESSION, keys::EVENTS_SESSION_KEY_PATH.into())
+            .build()?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use gloo_utils::format::JsValueSerdeExt;
+    use indexed_db_futures::{prelude::*, transaction::TransactionMode};
+    use matrix_sdk_test::async_test;
+    use serde_json::json;
+    use wasm_bindgen::JsValue;
+
+    use super::*;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[async_test]
+    async fn test_v9_to_v10_empties_events_and_adds_session_index() {
+        let name = "test_v9_to_v10_empties_events_and_adds_session_index";
+
+        let db = Database::open(name)
+            .with_version(Version::V9 as u32)
+            .with_on_upgrade_needed(|event, transaction| {
+                let mut version = Version::try_from(event.old_version() as u32)?;
+                while version < Version::V9 {
+                    version = version.upgrade(transaction)?.unwrap();
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let transaction =
+            db.transaction(v9::keys::EVENTS).with_mode(TransactionMode::Readwrite).build().unwrap();
+        let event =
+            JsValue::from_serde(&json!({ "id": ["chunk", "event"], "content": "" })).unwrap();
+        transaction.object_store(v9::keys::EVENTS).unwrap().put(&event).build().unwrap();
+        transaction.commit().await.unwrap();
+        db.close();
+
+        let db = open_and_upgrade_db(name).await.unwrap();
+        assert_eq!(db.version(), Version::V10 as u32 as f64);
+        let transaction = db.transaction(v10::keys::EVENTS).build().unwrap();
+        let events = transaction.object_store(v10::keys::EVENTS).unwrap();
+        assert_eq!(events.count().await.unwrap(), 0);
+        assert!(events.index_names().any(|index| index == v10::keys::EVENTS_SESSION));
+        transaction.commit().await.unwrap();
+        db.close();
     }
 }
