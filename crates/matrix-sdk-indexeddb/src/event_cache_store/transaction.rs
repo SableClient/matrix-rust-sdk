@@ -29,8 +29,8 @@ use crate::{
             IndexedChunk, IndexedChunkIdKey, IndexedEvent, IndexedEventError,
             IndexedEventEventIdKey, IndexedEventIdKey, IndexedEventOutOfBandKey,
             IndexedEventPositionKey, IndexedEventRelationKey, IndexedEventRoomKey,
-            IndexedEventTimestampKey, IndexedGapIdKey, IndexedLease, IndexedLeaseIdKey,
-            IndexedNextChunkIdKey, IndexedThread, IndexedThreadIdKey,
+            IndexedEventSessionKey, IndexedEventTimestampKey, IndexedGapIdKey, IndexedLease,
+            IndexedLeaseIdKey, IndexedNextChunkIdKey, IndexedThread, IndexedThreadIdKey,
         },
         types::{Chunk, ChunkType, Event, Gap, Lease, Position, Thread},
     },
@@ -453,6 +453,18 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
             self.serializer().inner(),
         );
         self.get_items_by_key::<Event, IndexedEventRelationKey>(range).await
+    }
+
+    /// Query IndexedDB for events in the given room which were encrypted with
+    /// the given Megolm session.
+    pub async fn get_events_by_session(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<Vec<Event>, TransactionError> {
+        let range =
+            IndexedKeyRange::all_with_prefix((room_id, session_id), self.serializer().inner());
+        self.get_items_by_key::<Event, IndexedEventSessionKey>(range).await
     }
 
     pub async fn contains_out_of_band_event(

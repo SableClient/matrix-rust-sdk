@@ -21,10 +21,10 @@ use thiserror::Error;
 
 /// The current version and keys used in the database.
 pub mod current {
-    use super::{Version, v10};
+    use super::{Version, v11};
 
-    pub const VERSION: Version = Version::V10;
-    pub use v10::keys;
+    pub const VERSION: Version = Version::V11;
+    pub use v11::keys;
 }
 
 /// Opens a connection to the IndexedDB database and takes care of upgrading it
@@ -72,6 +72,8 @@ pub enum Version {
     V9 = 9,
     /// Version 10 of the database, for details see [`v10`].
     V10 = 10,
+    /// Version 11 of the database, for details see [`v11`].
+    V11 = 11,
 }
 
 impl Version {
@@ -88,7 +90,8 @@ impl Version {
             Self::V7 => v7::upgrade(transaction).map(Some),
             Self::V8 => v8::upgrade(transaction).map(Some),
             Self::V9 => v9::upgrade(transaction).map(Some),
-            Self::V10 => Ok(None),
+            Self::V10 => v10::upgrade(transaction).map(Some),
+            Self::V11 => Ok(None),
         }
     }
 }
@@ -113,6 +116,7 @@ impl TryFrom<u32> for Version {
             8 => Ok(Version::V8),
             9 => Ok(Version::V9),
             10 => Ok(Version::V10),
+            11 => Ok(Version::V11),
             v => Err(UnknownVersionError(v)),
         }
     }
@@ -588,6 +592,20 @@ pub mod v9 {
 }
 
 pub mod v10 {
+    /// Upgrade either deployed `v10` schema to `v11`.
+    pub fn upgrade(transaction: &Transaction<'_>) -> Result<Version, Error> {
+        // Upstream indexed timestamps in v10; Sable indexed Megolm sessions.
+        empty_event_cache(transaction)?;
+        let events = transaction.object_store(keys::EVENTS)?;
+        if !events.index_names().any(|name| name == keys::EVENTS_TIMESTAMP) {
+            add_timestamp_index_to_events_object_store(transaction)?;
+        }
+        if !events.index_names().any(|name| name == v11::keys::EVENTS_SESSION) {
+            v11::add_session_index_to_events_object_store(transaction)?;
+        }
+        Ok(Version::V11)
+    }
+
     use indexed_db_futures::Build;
 
     use super::*;
@@ -631,5 +649,87 @@ pub mod v10 {
         threads.clear()?;
 
         Ok(())
+    }
+}
+
+pub mod v11 {
+    use super::*;
+    use indexed_db_futures::Build;
+
+    pub mod keys {
+        pub use super::v10::keys::*;
+        pub const EVENTS_SESSION: &str = "events_session";
+        pub const EVENTS_SESSION_KEY_PATH: &str = "session";
+    }
+
+    /// Add the Megolm session index used to find events for decryption.
+    pub fn add_session_index_to_events_object_store(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), Error> {
+        transaction
+            .object_store(keys::EVENTS)?
+            .create_index(keys::EVENTS_SESSION, keys::EVENTS_SESSION_KEY_PATH.into())
+            .build()?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use super::*;
+    use gloo_utils::format::JsValueSerdeExt;
+    use indexed_db_futures::{prelude::*, transaction::TransactionMode};
+    use matrix_sdk_test::async_test;
+    use serde_json::json;
+    use wasm_bindgen::JsValue;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[async_test]
+    async fn test_v9_and_both_v10_schemas_upgrade_to_v11() {
+        for (name, session_index) in [
+            ("v9_to_v11", None),
+            ("sable_v10_to_v11", Some(true)),
+            ("upstream_v10_to_v11", Some(false)),
+        ] {
+            let db = Database::open(name)
+                .with_version(if session_index.is_some() { 10u32 } else { 9u32 })
+                .with_on_upgrade_needed(move |event, transaction| {
+                    let mut version = Version::try_from(event.old_version() as u32)?;
+                    while version < Version::V9 {
+                        version = version.upgrade(transaction)?.unwrap();
+                    }
+                    match session_index {
+                        Some(true) => v11::add_session_index_to_events_object_store(transaction)?,
+                        Some(false) => {
+                            v10::add_timestamp_index_to_events_object_store(transaction)?
+                        }
+                        None => {}
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let transaction = db
+                .transaction(v9::keys::EVENTS)
+                .with_mode(TransactionMode::Readwrite)
+                .build()
+                .unwrap();
+            let event =
+                JsValue::from_serde(&json!({ "id": ["chunk", "event"], "content": "" })).unwrap();
+            transaction.object_store(v9::keys::EVENTS).unwrap().put(&event).build().unwrap();
+            transaction.commit().await.unwrap();
+            db.close();
+
+            let db = open_and_upgrade_db(name).await.unwrap();
+            assert_eq!(db.version(), Version::V11 as u32 as f64);
+            let transaction = db.transaction(v11::keys::EVENTS).build().unwrap();
+            let events = transaction.object_store(v11::keys::EVENTS).unwrap();
+            assert_eq!(events.count().await.unwrap(), 0);
+            assert!(events.index_names().any(|name| name == v11::keys::EVENTS_SESSION));
+            assert!(events.index_names().any(|name| name == v11::keys::EVENTS_TIMESTAMP));
+            transaction.commit().await.unwrap();
+            db.close();
+        }
     }
 }

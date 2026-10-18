@@ -93,6 +93,9 @@ pub type IndexedRelationType = String;
 /// `TimelineEvent::timestamp()`), in milliseconds since the Unix epoch,
 /// which is suitable for use in an IndexedDB key
 pub type IndexedEventTimestamp = u64;
+/// A (possibly) hashed representation of a Megolm session ID which is suitable
+/// for use in an IndexedDB key
+pub type IndexedSessionId = String;
 
 /// A (possibly) encrypted representation of an [`Event`]
 pub type IndexedEventContent = MaybeEncrypted;
@@ -342,6 +345,9 @@ pub struct IndexedEvent {
     /// An indexed key on the object store, which represents the
     /// timestamp of the event (from `TimelineEvent::timestamp()`), if known.
     pub timestamp: Option<IndexedEventTimestampKey>,
+    /// An indexed key on the object store, which represents the Megolm session
+    /// used to encrypt the event, if it was encrypted.
+    pub session: Option<IndexedEventSessionKey>,
     /// The (possibly) encrypted content of the event.
     pub content: IndexedEventContent,
 }
@@ -386,6 +392,9 @@ impl Indexed for Event {
         let timestamp = self.timestamp().map(|timestamp| {
             IndexedEventTimestampKey::encode((self.room_id(), timestamp), serializer)
         });
+        let session = self.content().kind.session_id().map(|session_id| {
+            IndexedEventSessionKey::encode((self.room_id(), session_id, event_id), serializer)
+        });
         Ok(IndexedEvent {
             id,
             event_id: IndexedEventEventIdKey::encode(event_id, serializer),
@@ -394,6 +403,7 @@ impl Indexed for Event {
             out_of_band,
             relation,
             timestamp,
+            session,
             content: serializer.maybe_encrypt_value(self)?,
         })
     }
@@ -691,6 +701,53 @@ impl IndexedKey<Event> for IndexedEventTimestampKey {
     ) -> Self {
         let room_id = serializer.encode_key_as_string(keys::ROOMS, room_id);
         Self(room_id, u64::from(timestamp.get()))
+    }
+}
+
+/// The value associated with the [`session`](IndexedEvent::session) index of
+/// the [`EVENTS`][1] object store, which is constructed from:
+///
+/// - The (possibly) hashed Room ID
+/// - The (possibly) hashed Megolm session ID
+/// - The (possibly) hashed Event ID.
+///
+/// [1]: crate::event_cache_store::migrations::v11::add_session_index_to_events_object_store
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IndexedEventSessionKey(IndexedRoomId, IndexedSessionId, IndexedEventId);
+
+impl IndexedKey<Event> for IndexedEventSessionKey {
+    const INDEX: Option<&'static str> = Some(keys::EVENTS_SESSION);
+
+    type KeyComponents<'a> = (&'a RoomId, &'a str, &'a EventId);
+
+    fn encode(
+        (room_id, session_id, event_id): Self::KeyComponents<'_>,
+        serializer: &SafeEncodeSerializer,
+    ) -> Self {
+        let room_id = serializer.encode_key_as_string(keys::ROOMS, room_id);
+        let session_id = serializer.encode_key_as_string(keys::EVENTS_SESSION, session_id);
+        let event_id = serializer.encode_key_as_string(keys::EVENTS, event_id);
+        Self(room_id, session_id, event_id)
+    }
+}
+
+impl IndexedPrefixKeyBounds<Event, (&RoomId, &str)> for IndexedEventSessionKey {
+    fn lower_key_with_prefix(
+        (room_id, session_id): (&RoomId, &str),
+        serializer: &SafeEncodeSerializer,
+    ) -> Self {
+        let room_id = serializer.encode_key_as_string(keys::ROOMS, room_id);
+        let session_id = serializer.encode_key_as_string(keys::EVENTS_SESSION, session_id);
+        Self(room_id, session_id, (*INDEXED_KEY_LOWER_STRING).clone())
+    }
+
+    fn upper_key_with_prefix(
+        (room_id, session_id): (&RoomId, &str),
+        serializer: &SafeEncodeSerializer,
+    ) -> Self {
+        let room_id = serializer.encode_key_as_string(keys::ROOMS, room_id);
+        let session_id = serializer.encode_key_as_string(keys::EVENTS_SESSION, session_id);
+        Self(room_id, session_id, (*INDEXED_KEY_UPPER_STRING).clone())
     }
 }
 
