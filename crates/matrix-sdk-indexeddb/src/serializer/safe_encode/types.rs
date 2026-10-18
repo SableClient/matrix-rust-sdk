@@ -22,7 +22,10 @@ use gloo_utils::format::JsValueSerdeExt;
 use indexed_db_futures::KeyRange;
 use matrix_sdk_crypto::CryptoStoreError;
 use matrix_sdk_store_encryption::{EncryptedValueBase64, StoreCipher};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
+};
 use wasm_bindgen::JsValue;
 use zeroize::Zeroizing;
 
@@ -72,15 +75,46 @@ impl From<web_sys::DomException> for SafeEncodeSerializerError {
 
 impl From<serde_wasm_bindgen::Error> for SafeEncodeSerializerError {
     fn from(e: serde_wasm_bindgen::Error) -> Self {
-        Self::Serialization(serde::de::Error::custom(e.to_string()))
+        Self::Serialization(de::Error::custom(e.to_string()))
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum MaybeEncrypted {
     Encrypted(EncryptedValueBase64),
     Unencrypted(String),
+}
+
+// A derived untagged `Deserialize` tries `Encrypted` first, and with
+// `serde_wasm_bindgen` every failed attempt allocates a JavaScript `Error`.
+impl<'de> Deserialize<'de> for MaybeEncrypted {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MaybeEncryptedVisitor;
+
+        impl<'de> Visitor<'de> for MaybeEncryptedVisitor {
+            type Value = MaybeEncrypted;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string or an encrypted value")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(MaybeEncrypted::Unencrypted(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(MaybeEncrypted::Unencrypted(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                EncryptedValueBase64::deserialize(MapAccessDeserializer::new(map))
+                    .map(MaybeEncrypted::Encrypted)
+            }
+        }
+
+        deserializer.deserialize_any(MaybeEncryptedVisitor)
+    }
 }
 
 impl SafeEncodeSerializer {
