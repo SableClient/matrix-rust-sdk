@@ -63,6 +63,32 @@ pub struct SendMessageLikeEventResult {
     pub encryption_info: Option<EncryptionInfo>,
 }
 
+#[cfg(feature = "e2e-encryption")]
+impl Room {
+    /// Encrypt event content after sharing the room key with the room's devices.
+    ///
+    /// This is intended for endpoints that accept encrypted event content without
+    /// immediately sending the event, such as delayed events.
+    pub async fn encrypt_raw_event(
+        &self,
+        event_type: &str,
+        content: &Raw<AnyMessageLikeEventContent>,
+    ) -> Result<Raw<ruma::events::room::encrypted::RoomEncryptedEventContent>> {
+        self.ensure_room_joined()?;
+        if !self.latest_encryption_state().await?.is_encrypted() {
+            return Err(crate::Error::InsufficientData);
+        }
+        ensure_room_encryption_ready(self).await?;
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(crate::Error::InsufficientData)?;
+        Ok(machine
+            .encrypt_room_event_raw(self.room_id(), event_type, content)
+            .await?
+            .content
+            .cast_unchecked())
+    }
+}
+
 /// Future returned by [`Room::send`].
 #[allow(missing_debug_implementations)]
 pub struct SendMessageLikeEvent<'a> {
