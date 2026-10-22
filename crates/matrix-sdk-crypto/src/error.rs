@@ -98,6 +98,9 @@ pub enum OlmError {
 /// Error representing a failure during a group encryption operation.
 #[derive(Error, Debug)]
 pub enum MegolmError {
+    /// No usable outbound group session is available for encryption.
+    #[error("no usable outbound group session")]
+    MissingOutboundSession,
     /// The event that should have been decrypted is malformed.
     #[error(transparent)]
     EventError(#[from] EventError),
