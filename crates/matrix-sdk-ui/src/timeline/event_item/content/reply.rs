@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use imbl::Vector;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId};
+use ruma::{
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, events::AnySyncTimelineEvent, serde::Raw,
+};
 use tracing::{debug, instrument, warn};
 
 use super::TimelineItemContent;
@@ -65,6 +67,10 @@ impl InReplyToDetails {
 pub struct EmbeddedEvent {
     /// The content of the embedded item.
     pub content: TimelineItemContent,
+    /// The original event JSON, decrypted when available.
+    ///
+    /// This is absent for local echoes and redacted events. Edits do not replace it.
+    pub original_json: Option<Raw<AnySyncTimelineEvent>>,
     /// The user ID of the sender of the related embedded event.
     pub sender: OwnedUserId,
     /// The profile of the sender of the related embedded event.
@@ -82,6 +88,11 @@ impl EmbeddedEvent {
     /// Create a [`EmbeddedEvent`] from a loaded event timeline item.
     pub fn from_timeline_item(timeline_item: &EventTimelineItem) -> Self {
         Self {
+            original_json: if timeline_item.content.is_redacted() {
+                None
+            } else {
+                timeline_item.original_json().cloned()
+            },
             content: timeline_item.content.clone(),
             sender: timeline_item.sender.clone(),
             sender_profile: timeline_item.sender_profile.clone(),
@@ -139,7 +150,15 @@ impl EmbeddedEvent {
                 let sender_profile = TimelineDetails::from_initial_value(
                     room_data_provider.profile_from_user_id(&sender).await,
                 );
-                Ok(Some(Self { content, sender, sender_profile, timestamp, identifier }))
+                let original_json = (!content.is_redacted()).then(|| raw_event.clone());
+                Ok(Some(Self {
+                    content,
+                    original_json,
+                    sender,
+                    sender_profile,
+                    timestamp,
+                    identifier,
+                }))
             }
             [TimelineAction::HandleAggregation { kind, .. }] => {
                 // As an exception, edits are allowed to be embedded events.
@@ -186,7 +205,14 @@ impl EmbeddedEvent {
                     let sender_profile = TimelineDetails::from_initial_value(
                         room_data_provider.profile_from_user_id(&sender).await,
                     );
-                    Ok(Some(Self { content, sender, sender_profile, timestamp, identifier }))
+                    Ok(Some(Self {
+                        content,
+                        original_json: Some(raw_event.clone()),
+                        sender,
+                        sender_profile,
+                        timestamp,
+                        identifier,
+                    }))
                 } else {
                     Ok(None)
                 }
