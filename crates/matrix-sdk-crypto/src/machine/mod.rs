@@ -1236,9 +1236,7 @@ impl OlmMachine {
     ///
     /// - `event_type` - The plaintext type of the event.
     ///
-    /// # Panics
-    ///
-    /// Panics if a group session for the given room wasn't shared beforehand.
+    /// Returns an error if no usable outbound group session is available.
     pub async fn encrypt_room_event_raw(
         &self,
         room_id: &RoomId,
@@ -3445,6 +3443,7 @@ fn megolm_error_to_utd_info(
 ) -> Result<UnableToDecryptInfo, CryptoStoreError> {
     use MegolmError::*;
     let reason = match error {
+        MissingOutboundSession => UnableToDecryptReason::MegolmDecryptionFailure,
         EventError(_) => UnableToDecryptReason::MalformedEncryptedEvent,
         Decode(_) => UnableToDecryptReason::MalformedEncryptedEvent,
         MissingRoomKey(maybe_withheld) => {
