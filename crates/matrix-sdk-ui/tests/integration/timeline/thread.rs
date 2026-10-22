@@ -2282,6 +2282,10 @@ async fn test_redacted_replied_to_is_updated() {
     assert_eq!(in_reply_to.event_id, first_reply);
     assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
     assert!(replied_to_event.content.is_redacted());
+    assert!(replied_to_event.original_json.is_none());
+    assert!(
+        matrix_sdk_ui::timeline::EmbeddedEvent::from_timeline_item(ev1).original_json.is_none()
+    );
 
     // Finally, the first reply is being removed.
     assert_let!(VectorDiff::Remove { index: 1 } = &timeline_updates[2]);

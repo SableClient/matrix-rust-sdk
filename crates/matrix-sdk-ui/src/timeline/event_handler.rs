@@ -925,6 +925,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         };
 
         let embedded_event = EmbeddedEvent {
+            original_json: None,
             content: TimelineItemContent::MsgLike(MsgLikeContent::redacted()),
             sender,
             sender_profile,
