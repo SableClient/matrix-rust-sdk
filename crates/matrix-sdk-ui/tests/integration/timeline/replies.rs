@@ -102,6 +102,10 @@ async fn test_in_reply_to_details() {
         let in_reply_to = in_reply_to.clone().unwrap();
         assert_eq!(in_reply_to.event_id, eid1);
         assert_let!(TimelineDetails::Ready(embedded) = in_reply_to.event);
+        assert_eq!(
+            embedded.original_json.as_ref().unwrap().json().get(),
+            first.as_event().unwrap().original_json().unwrap().json().get()
+        );
         assert_eq!(embedded.timestamp, timestamp);
         assert_eq!(embedded.identifier, TimelineEventItemId::EventId(eid1.to_owned()));
 
@@ -230,7 +234,10 @@ async fn test_in_reply_to_details() {
                 ..
             }) = third.as_event().unwrap().content()
         );
-        assert_matches!(in_reply_to.clone().unwrap().event, TimelineDetails::Ready(_));
+        assert_let!(TimelineDetails::Ready(embedded) = &in_reply_to.as_ref().unwrap().event);
+        let original: serde_json::Value =
+            embedded.original_json.as_ref().unwrap().deserialize_as_unchecked().unwrap();
+        assert_eq!(original["content"]["body"], "Alice is gonna arrive soon");
         assert_eq!(*third.unique_id(), third_unique_id);
 
         assert_pending!(timeline_stream);
