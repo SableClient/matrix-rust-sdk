@@ -51,7 +51,10 @@ use ruma::{
 };
 use tracing::{Span, debug, error, instrument, trace, warn};
 
-use super::{QueueStorage, QueueThumbnailInfo, RoomSendQueue, RoomSendQueueError};
+use super::{
+    QueueStorage, QueueThumbnailInfo, RoomSendQueue, RoomSendQueueError, check_dependent_edit_size,
+    check_event_size,
+};
 use crate::{
     Client, Media, Room,
     attachment::{AttachmentConfig, Thumbnail},
@@ -333,6 +336,13 @@ impl RoomSendQueue {
 
         let created_at = MilliSecondsSinceUnixEpoch::now();
 
+        let serialized = merge_extra_content(
+            SerializableEventContent::new(&event_content.clone().into())
+                .map_err(RoomSendQueueStorageError::JsonSerialization)?,
+            extra_content.clone(),
+        )?;
+        check_event_size(serialized.raw().0)?;
+
         // Save requests in the queue storage.
         self.inner
             .queue
@@ -362,11 +372,7 @@ impl RoomSendQueue {
         self.send_update(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
             transaction_id: send_event_txn.clone().into(),
             content: LocalEchoContent::Event {
-                serialized_event: merge_extra_content(
-                    SerializableEventContent::new(&event_content.into())
-                        .map_err(RoomSendQueueStorageError::JsonSerialization)?,
-                    extra_content,
-                )?,
+                serialized_event: serialized,
                 send_handle: send_handle.clone(),
                 send_error: None,
             },
@@ -475,6 +481,13 @@ impl RoomSendQueue {
         // Save requests in the queue storage.
         let item_extra_content: Vec<_> =
             item_queue_infos.iter().map(|item| item.extra_content.clone()).collect();
+        let serialized = merge_gallery_extra_content(
+            SerializableEventContent::new(&event_content.clone().into())
+                .map_err(RoomSendQueueStorageError::JsonSerialization)?,
+            extra_content.clone(),
+            item_extra_content,
+        )?;
+        check_event_size(serialized.raw().0)?;
 
         self.inner
             .queue
@@ -501,12 +514,7 @@ impl RoomSendQueue {
         self.send_update(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
             transaction_id: send_event_txn.clone().into(),
             content: LocalEchoContent::Event {
-                serialized_event: merge_gallery_extra_content(
-                    SerializableEventContent::new(&event_content.into())
-                        .map_err(RoomSendQueueStorageError::JsonSerialization)?,
-                    extra_content,
-                    item_extra_content,
-                )?,
+                serialized_event: serialized,
                 send_handle: send_handle.clone(),
                 send_error: None,
             },
@@ -807,6 +815,8 @@ impl QueueStorage {
             extra_content,
         )?;
 
+        check_event_size(new_content.raw().0)?;
+
         // Indicates observers that the upload finished, by editing the local
         // echo for the event into its final form before sending.
         new_updates.push(RoomSendQueueUpdate::ReplacedLocalEvent {
@@ -887,6 +897,8 @@ impl QueueStorage {
             extra_content,
             item_extra_content,
         )?;
+
+        check_event_size(new_content.raw().0)?;
 
         // Indicates observers that the upload finished, by editing the local
         // echo for the event into its final form before sending.
@@ -1168,6 +1180,11 @@ impl QueueStorage {
                     return Err(InvalidMediaCaptionEdit);
                 }
 
+                let serialized = merge_extra_content(
+                    SerializableEventContent::new(&(*local_echo).clone().into())?,
+                    extra_content.clone(),
+                )?;
+                check_event_size(serialized.raw().0)?;
                 let new_dependent_request = DependentQueuedRequestKind::FinishUpload {
                     local_echo: local_echo.clone(),
                     file_upload,
@@ -1183,11 +1200,7 @@ impl QueueStorage {
                     .await?;
 
                 trace!("caption successfully updated");
-                return merge_extra_content(
-                    SerializableEventContent::new(&(*local_echo).into())?,
-                    extra_content,
-                )
-                .map(Some);
+                return Ok(Some(serialized));
             }
         }
 
@@ -1210,10 +1223,13 @@ impl QueueStorage {
             mentions,
         )?;
 
+        check_event_size(new_serialized.raw().0)?;
+
         // If the request is active (being sent), send a dependent request.
         if let Some(being_sent) = guard.being_sent.as_ref()
             && being_sent.transaction_id == *txn
         {
+            check_dependent_edit_size(&new_serialized)?;
             // Record a dependent request to edit, and exit.
             store
                 .save_dependent_queued_request(
