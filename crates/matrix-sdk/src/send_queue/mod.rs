@@ -33,6 +33,11 @@
 //! out of order; the queue resumes when the wedged request is retried (with
 //! [`SendHandle::unwedge`]) or removed (with [`SendHandle::abort`]).
 //!
+//! Event content whose canonical JSON exceeds the complete event size limit is
+//! rejected with [`RoomSendQueueStorageError::EventTooLarge`] before it is
+//! queued. This is a lower bound: the complete event, including server-added
+//! fields and any encryption overhead, may still exceed the limit.
+//!
 //! It is possible to control whether a single room is enabled using
 //! [`RoomSendQueue::set_enabled()`].
 //!
@@ -173,11 +178,17 @@ use ruma::{
     api::error::ErrorKind,
     events::{
         AnyMessageLikeEventContent, Mentions, MessageLikeEventContent as _, TimelineEventType,
+        poll::unstable_start::{
+            ReplacementUnstablePollStartEventContent, UnstablePollStartEventContent,
+        },
         reaction::ReactionEventContent,
         relation::Annotation,
         room::{
             MediaSource,
-            message::{FormattedBody, RoomMessageEventContent},
+            message::{
+                FormattedBody, ReplacementMetadata, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
         },
     },
     serde::Raw,
@@ -203,6 +214,9 @@ pub use progress::AbstractProgress;
 /// How long to wait before retrying, when loading the next request to send
 /// failed against the state store.
 const STORE_ERROR_BACKOFF: Duration = Duration::from_millis(250);
+
+/// https://spec.matrix.org/latest/client-server-api/#size-limits
+const MAX_EVENT_SIZE: usize = 65_536;
 
 /// A client-wide send queue, for all the rooms known by a client.
 pub struct SendQueue {
@@ -1623,6 +1637,13 @@ impl QueueStorage {
         request: QueuedRequestKind,
         created_at: MilliSecondsSinceUnixEpoch,
     ) -> Result<OwnedTransactionId, RoomSendQueueStorageError> {
+        match &request {
+            QueuedRequestKind::Event { content, .. } => check_event_size(content.raw().0)?,
+            QueuedRequestKind::Redaction { reason, .. } => {
+                check_event_size(&serde_json::json!({ "reason": reason }))?;
+            }
+            QueuedRequestKind::MediaUpload { .. } => {}
+        }
         let transaction_id = TransactionId::new();
 
         self.store
@@ -1815,6 +1836,7 @@ impl QueueStorage {
         if guard.being_sent.as_ref().map(|info| info.transaction_id.as_ref())
             == Some(transaction_id)
         {
+            check_event_size(&serde_json::json!({ "reason": reason }))?;
             // Save the intent to redact the event.
             guard
                 .client()?
@@ -1853,6 +1875,7 @@ impl QueueStorage {
         transaction_id: &TransactionId,
         serializable: SerializableEventContent,
     ) -> Result<bool, RoomSendQueueStorageError> {
+        check_event_size(serializable.raw().0)?;
         let guard = self.store.lock().await;
         let client = guard.client()?;
         let store = client.state_store();
@@ -1868,6 +1891,7 @@ impl QueueStorage {
         if guard.being_sent.as_ref().map(|info| info.transaction_id.as_ref())
             == Some(transaction_id)
         {
+            check_dependent_edit_size(&serializable)?;
             // Save the intent to edit the associated event.
             store
                 .save_dependent_queued_request(
@@ -2231,6 +2255,10 @@ impl QueueStorage {
             }
         }
 
+        check_event_size(&serde_json::json!({
+            "m.relates_to": { "rel_type": "m.annotation", "key": key }
+        }))?;
+
         // Record the dependent request.
         let reaction_txn_id = ChildTransactionId::new();
         store
@@ -2524,19 +2552,7 @@ impl QueueStorage {
                         }
                     };
 
-                    let mut edit_json = serde_json::to_value(&edit_event)
-                        .map_err(RoomSendQueueStorageError::JsonSerialization)?;
-
-                    // Only in the new content: the top level is what push rules
-                    // see, and an edit mustn't notify again.
-                    if let Some(serde_json::Value::Object(mut unknown)) = unknown_fields
-                        && let Some(edited) = edit_json.get_mut("m.new_content")
-                    {
-                        // The edit has its own relation and new content.
-                        unknown.remove("m.relates_to");
-                        unknown.remove("m.new_content");
-                        upload::restore_unknown_fields(edited, unknown.into());
-                    }
+                    let edit_json = edit_event_json(&edit_event, unknown_fields)?;
 
                     // Queue the edit event in the send queue 🧠.
                     let serializable = SerializableEventContent::from_raw(
@@ -2546,6 +2562,8 @@ impl QueueStorage {
                         ),
                         edit_event.event_type().to_string(),
                     );
+
+                    check_event_size(serializable.raw().0)?;
 
                     store
                         .save_send_queue_request(
@@ -2561,6 +2579,7 @@ impl QueueStorage {
                     // The parent event is still local; update the local echo.
                     let parent_transaction_id = &dependent_request.parent_transaction_id;
 
+                    check_event_size(new_content.raw().0)?;
                     let request = QueuedRequestKind::Event {
                         content: new_content,
                         #[cfg(feature = "unstable-msc4354")]
@@ -2649,6 +2668,8 @@ impl QueueStorage {
                             .map_err(RoomSendQueueStorageError::JsonSerialization)?,
                         react_event.event_type().to_string(),
                     );
+
+                    check_event_size(serializable.raw().0)?;
 
                     store
                         .save_send_queue_request(
@@ -2791,6 +2812,17 @@ impl QueueStorage {
 
                         num_dependent_requests -= 1;
                     }
+                }
+
+                Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge)) => {
+                    store
+                        .remove_dependent_queued_request(&self.room_id, &dependent_id)
+                        .await
+                        .map_err(RoomSendQueueStorageError::StateStoreError)?;
+                    new_updates.push(RoomSendQueueUpdate::CancelledLocalEvent {
+                        transaction_id: dependent_id.into(),
+                    });
+                    num_dependent_requests -= 1;
                 }
 
                 Err(err) => {
@@ -2976,6 +3008,69 @@ pub struct SendQueueUpdate {
     pub update: RoomSendQueueUpdate,
 }
 
+fn check_event_size(content: &impl serde::Serialize) -> Result<(), RoomSendQueueStorageError> {
+    let canonical: ruma::CanonicalJsonValue =
+        serde_json::from_str(&serde_json::to_string(content)?)?;
+    if canonical.to_string().len() > MAX_EVENT_SIZE {
+        return Err(RoomSendQueueStorageError::EventTooLarge);
+    }
+    Ok(())
+}
+
+fn edit_event_json(
+    edit_event: &AnyMessageLikeEventContent,
+    unknown_fields: Option<serde_json::Value>,
+) -> Result<serde_json::Value, RoomSendQueueStorageError> {
+    let mut edit_json = serde_json::to_value(edit_event)?;
+
+    // Only in the new content: the top level is what push rules see, and an
+    // edit mustn't notify again.
+    if let Some(serde_json::Value::Object(mut unknown)) = unknown_fields
+        && let Some(edited) = edit_json.get_mut("m.new_content")
+    {
+        // The edit has its own relation and new content.
+        unknown.remove("m.relates_to");
+        unknown.remove("m.new_content");
+        upload::restore_unknown_fields(edited, unknown.into());
+    }
+
+    Ok(edit_json)
+}
+
+fn check_dependent_edit_size(
+    new_content: &SerializableEventContent,
+) -> Result<(), RoomSendQueueStorageError> {
+    let event_id = ruma::owned_event_id!("$");
+    let (replacement, unknown_fields) = match new_content.deserialize()? {
+        AnyMessageLikeEventContent::RoomMessage(content) => {
+            let unknown = upload::unknown_fields(new_content, &content);
+            // The eventual edit can notify any subset of the new mentions.
+            // Using them all as original mentions leaves the smallest fallback.
+            let mentions = content.mentions.clone();
+            let replacement = RoomMessageEventContentWithoutRelation::from(content)
+                .make_replacement(ReplacementMetadata::new(event_id, mentions));
+            (replacement.into(), unknown)
+        }
+        AnyMessageLikeEventContent::UnstablePollStart(content) => {
+            let poll_start = content.poll_start().clone();
+            let replacement = ReplacementUnstablePollStartEventContent::plain_text(
+                poll_start.question.text.clone(),
+                poll_start,
+                event_id,
+            );
+            (UnstablePollStartEventContent::Replacement(replacement).into(), None)
+        }
+        _ => return Ok(()),
+    };
+
+    let mut json = edit_event_json(&replacement, unknown_fields)?;
+    // The target's server-assigned ID is not known until the send finishes.
+    if let Some(serde_json::Value::Object(relation)) = json.get_mut("m.relates_to") {
+        relation.remove("event_id");
+    }
+    check_event_size(&json)
+}
+
 /// An error triggered by the send queue module.
 #[derive(Debug, thiserror::Error)]
 pub enum RoomSendQueueError {
@@ -3016,6 +3111,11 @@ pub enum RoomSendQueueError {
 /// An error triggered by the send queue storage.
 #[derive(Debug, thiserror::Error)]
 pub enum RoomSendQueueStorageError {
+    /// The canonical JSON event content exceeds the 65,536-byte limit for a
+    /// [complete Matrix event](https://spec.matrix.org/latest/client-server-api/#size-limits).
+    #[error("the event content exceeds the Matrix event size limit")]
+    EventTooLarge,
+
     /// Error caused by the state store.
     #[error(transparent)]
     StateStoreError(#[from] StoreError),
