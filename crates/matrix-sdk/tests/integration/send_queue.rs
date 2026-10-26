@@ -5,7 +5,7 @@ use eyeball_im::VectorDiff;
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk::attachment::{GalleryConfig, GalleryItemInfo};
 use matrix_sdk::{
-    Client, MemoryStore, ThreadingSupport, assert_let_timeout,
+    Client, MemoryStore, StateStore as _, ThreadingSupport, assert_let_timeout,
     attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo, Thumbnail},
     authentication::matrix::MatrixSession,
     config::StoreConfig,
@@ -578,6 +578,338 @@ async fn test_smoke_raw() {
     assert_update!((global_watch, watch) => sent { txn = txn1, event_id = event_id });
 
     assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_oversized_events_are_not_queued() {
+    let mock = MatrixMockServer::new().await;
+    let store = Arc::new(MemoryStore::new());
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess).state_store(store.clone()),
+            )
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    q.set_enabled(false);
+    let mut global_watch = client.send_queue().subscribe();
+    let (_, mut watch) = q.subscribe().await.unwrap();
+
+    assert_matches!(
+        q.send(RoomMessageEventContent::text_plain("x".repeat(65_536)).into()).await,
+        Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+    );
+    assert_matches!(
+        q.send(RoomMessageEventContent::text_plain("small").into())
+            .with_extra_content(
+                serde_json::from_value(json!({ "extra": "x".repeat(65_536) })).unwrap()
+            )
+            .await,
+        Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+    );
+    assert_matches!(
+        q.send(RoomMessageEventContent::text_html("x".repeat(33_000), "x".repeat(33_000)).into())
+            .await,
+        Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+    );
+    for body in ["🦀".repeat(17_000), "\n".repeat(33_000)] {
+        let raw = Raw::from_json_string(json!({ "body": body }).to_string()).unwrap();
+        assert_matches!(
+            q.send_raw(raw, "com.example.custom".to_owned()).await,
+            Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+        );
+    }
+    assert_matches!(
+        q.redact(event_id!("$target").to_owned(), Some(&"x".repeat(65_536))).await,
+        Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+    );
+
+    assert!(store.load_send_queue_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(q.subscribe().await.unwrap().0.is_empty());
+    assert!(watch.is_empty());
+    assert!(global_watch.is_empty());
+
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$sent")).mock_once().mount().await;
+    q.send(RoomMessageEventContent::text_plain("later").into()).await.unwrap();
+    let (txn, _) = assert_update!((global_watch, watch) => local echo { body = "later" });
+    q.set_enabled(true);
+    assert_update!((global_watch, watch) => sent { txn = txn, event_id = event_id!("$sent") });
+}
+
+#[async_test]
+async fn test_event_size_uses_canonical_json_bytes() {
+    let mock = MatrixMockServer::new().await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    q.set_enabled(false);
+
+    // Whitespace and unnecessary Unicode escapes do not count towards the
+    // limit.
+    for json in [
+        format!("{{{}\"body\":\"small\"}}", " ".repeat(65_536)),
+        format!("{{\"body\":\"{}\"}}", r"\u0061".repeat(12_000)),
+    ] {
+        assert!(json.len() > 65_536);
+        let handle = q
+            .send_raw(Raw::from_json_string(json).unwrap(), "com.example.custom".to_owned())
+            .await
+            .unwrap();
+        assert!(handle.abort().await.unwrap());
+    }
+
+    let empty_content_size = json!({ "body": "" }).to_string().len();
+    for (size, accepted) in [(65_536, true), (65_537, false)] {
+        let json = json!({ "body": "x".repeat(size - empty_content_size) }).to_string();
+        assert_eq!(json.len(), size);
+        let result =
+            q.send_raw(Raw::from_json_string(json).unwrap(), "com.example.custom".to_owned()).await;
+        if accepted {
+            assert!(result.unwrap().abort().await.unwrap());
+        } else {
+            assert_matches!(
+                result,
+                Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+            );
+        }
+    }
+    assert!(q.subscribe().await.unwrap().0.is_empty());
+}
+
+#[async_test]
+async fn test_oversized_edits_leave_queued_event_unchanged() {
+    let mock = MatrixMockServer::new().await;
+    let store = Arc::new(MemoryStore::new());
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess).state_store(store.clone()),
+            )
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    q.set_enabled(false);
+    let mut global_watch = client.send_queue().subscribe();
+    let (_, mut watch) = q.subscribe().await.unwrap();
+    let handle = q.send(RoomMessageEventContent::text_plain("original").into()).await.unwrap();
+    let (original_txn, _) =
+        assert_update!((global_watch, watch) => local echo { body = "original" });
+
+    assert_matches!(
+        handle.edit(RoomMessageEventContent::text_plain("x".repeat(65_536)).into()).await,
+        Err(RoomSendQueueStorageError::EventTooLarge)
+    );
+    assert_matches!(
+        handle
+            .edit_raw(
+                Raw::from_json_string(json!({ "body": "x".repeat(65_536) }).to_string()).unwrap(),
+                "com.example.custom".to_owned(),
+            )
+            .await,
+        Err(RoomSendQueueStorageError::EventTooLarge)
+    );
+    assert_matches!(
+        handle.react("x".repeat(65_536)).await,
+        Err(RoomSendQueueStorageError::EventTooLarge)
+    );
+    assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+    let (echoes, _) = q.subscribe().await.unwrap();
+    assert_eq!(echoes.len(), 1);
+    assert_let!(LocalEchoContent::Event { serialized_event, .. } = &echoes[0].content);
+    assert_eq!(serialized_event.raw().0.get_field::<String>("body").unwrap().unwrap(), "original");
+    assert!(watch.is_empty());
+    assert!(global_watch.is_empty());
+
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$sent")).expect(2).mount().await;
+    q.send(RoomMessageEventContent::text_plain("later").into()).await.unwrap();
+    let (later_txn, _) = assert_update!((global_watch, watch) => local echo { body = "later" });
+    q.set_enabled(true);
+    assert_update!((global_watch, watch) => sent { txn = original_txn, });
+    assert_update!((global_watch, watch) => sent { txn = later_txn, });
+}
+
+#[async_test]
+async fn test_oversized_inflight_edits_are_not_queued() {
+    let mock = MatrixMockServer::new().await;
+    let store = Arc::new(MemoryStore::new());
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess).state_store(store.clone()),
+            )
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    let mut global_watch = client.send_queue().subscribe();
+    let (_, mut watch) = q.subscribe().await.unwrap();
+    let lock = Arc::new(Mutex::new(()));
+    let guard = lock.clone().lock_owned().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mock_started = started.clone();
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send()
+        .respond_with(move |_req: &Request| {
+            mock_started.notify_one();
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    drop(lock.lock().await);
+                });
+            })
+            .join()
+            .unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$sent" }))
+        })
+        .expect(2)
+        .mount()
+        .await;
+
+    let handle = q.send(RoomMessageEventContent::text_plain("original").into()).await.unwrap();
+    let (original_txn, _) =
+        assert_update!((global_watch, watch) => local echo { body = "original" });
+    timeout(Duration::from_secs(1), started.notified()).await.unwrap();
+
+    // This fits as a local replacement, but its edit fallback duplicates the
+    // body.
+    let content: AnyMessageLikeEventContent =
+        RoomMessageEventContent::text_plain("x".repeat(40_000)).into();
+    assert!(serde_json::to_string(&content).unwrap().len() < 65_536);
+    assert_matches!(handle.edit(content).await, Err(RoomSendQueueStorageError::EventTooLarge));
+    assert_matches!(
+        handle.abort_with_reason(Some("x".repeat(65_536))).await,
+        Err(RoomSendQueueStorageError::EventTooLarge)
+    );
+    assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(watch.is_empty());
+
+    q.send(RoomMessageEventContent::text_plain("later").into()).await.unwrap();
+    let (later_txn, _) = assert_update!((global_watch, watch) => local echo { body = "later" });
+    drop(guard);
+    assert_update!((global_watch, watch) => sent { txn = original_txn, });
+    assert_update!((global_watch, watch) => sent { txn = later_txn, });
+}
+
+#[async_test]
+async fn test_oversized_attachments_are_not_queued() {
+    let mock = MatrixMockServer::new().await;
+    let store = Arc::new(MemoryStore::new());
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess).state_store(store.clone()),
+            )
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    q.set_enabled(false);
+    let (_, watch) = q.subscribe().await.unwrap();
+
+    for config in [
+        AttachmentConfig::new().caption(Some(TextMessageEventContent::plain("x".repeat(65_536)))),
+        AttachmentConfig::new().extra_content(Some(
+            serde_json::from_value(json!({ "extra": "x".repeat(65_536) })).unwrap(),
+        )),
+    ] {
+        assert_matches!(
+            q.send_attachment("image.jpg", mime::IMAGE_JPEG, b"image".to_vec(), config).await,
+            Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+        );
+    }
+    assert!(store.load_send_queue_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(watch.is_empty());
+
+    let edited_event_id = event_id!("$original");
+    mock_edited_image_event(&mock, client.user_id().unwrap(), edited_event_id).await;
+    assert_matches!(
+        q.edit_with_attachment(
+            edited_event_id,
+            "image.jpg",
+            mime::IMAGE_JPEG,
+            b"image".to_vec(),
+            AttachmentConfig::new()
+                .caption(Some(TextMessageEventContent::plain("x".repeat(40_000)))),
+        )
+        .await,
+        Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+    );
+    assert!(store.load_send_queue_requests(room.room_id()).await.unwrap().is_empty());
+    assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+
+    let (handle, filename) = queue_attachment_no_thumbnail(&q).await;
+    assert_matches!(
+        handle.edit_media_caption(Some("x".repeat(65_536)), None, None).await,
+        Err(RoomSendQueueStorageError::EventTooLarge)
+    );
+    let (echoes, _) = q.subscribe().await.unwrap();
+    assert_eq!(echoes.len(), 1);
+    assert_let!(LocalEchoContent::Event { serialized_event, .. } = &echoes[0].content);
+    assert_eq!(serialized_event.raw().0.get_field::<String>("body").unwrap().unwrap(), filename);
+}
+
+#[cfg(feature = "unstable-msc4274")]
+#[async_test]
+async fn test_oversized_galleries_are_not_queued() {
+    let mock = MatrixMockServer::new().await;
+    let store = Arc::new(MemoryStore::new());
+    let client = mock
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::SingleProcess).state_store(store.clone()),
+            )
+        })
+        .build()
+        .await;
+    let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+    let q = room.send_queue();
+    q.set_enabled(false);
+    let (_, watch) = q.subscribe().await.unwrap();
+
+    for item_extra in [false, true] {
+        let mut gallery = GalleryConfig::new();
+        for _ in 0..2 {
+            gallery = gallery.add_item(GalleryItemInfo {
+                attachment_info: AttachmentInfo::Image(BaseImageInfo::default()),
+                content_type: mime::IMAGE_JPEG,
+                filename: "image.jpg".to_owned(),
+                data: b"image".to_vec(),
+                thumbnail: None,
+                caption: None,
+                extra_content: item_extra.then(|| {
+                    serde_json::from_value(json!({ "extra": "x".repeat(33_000) })).unwrap()
+                }),
+            });
+        }
+        if !item_extra {
+            gallery = gallery.extra_content(Some(
+                serde_json::from_value(json!({ "extra": "x".repeat(65_536) })).unwrap(),
+            ));
+        }
+        assert_matches!(
+            q.send_gallery(gallery).await,
+            Err(RoomSendQueueError::StorageError(RoomSendQueueStorageError::EventTooLarge))
+        );
+        assert!(store.load_send_queue_requests(room.room_id()).await.unwrap().is_empty());
+        assert!(store.load_dependent_queued_requests(room.room_id()).await.unwrap().is_empty());
+        assert!(watch.is_empty());
+    }
 }
 
 #[cfg(feature = "unstable-msc4354")]
