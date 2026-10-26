@@ -109,9 +109,11 @@ mod tests {
 
     use assert_matches::assert_matches;
     use matrix_sdk_test::{
-        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
+        InvitedRoomBuilder, JoinedRoomBuilder, SyncResponseBuilder, async_test,
+        event_factory::EventFactory,
     };
-    use ruma::{RoomVersionId, room_id, user_id};
+    use ruma::{RoomVersionId, events::AnySyncStateEvent, room_id, serde::Raw, user_id};
+    use serde_json::json;
 
     use crate::{RoomState, test_utils::logged_in_base_client};
 
@@ -122,6 +124,75 @@ mod tests {
 
         assert!(room.is_tombstoned().not());
         assert!(room.tombstone_content().is_none());
+        assert!(room.successor_room().is_none());
+    }
+
+    fn tombstone_without_successor(content: serde_json::Value) -> Raw<AnySyncStateEvent> {
+        Raw::new(&json!({
+            "type": "m.room.tombstone",
+            "state_key": "",
+            "sender": "@mnt_io:matrix.org",
+            "event_id": "$tombstone",
+            "origin_server_ts": 1,
+            "content": content,
+        }))
+        .unwrap()
+        .cast_unchecked()
+    }
+
+    #[async_test]
+    async fn test_tombstone_without_replacement_room() {
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r0");
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        let response = SyncResponseBuilder::new()
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(tombstone_without_successor(json!({ "body": "Room closed" }))),
+            )
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        assert!(room.is_tombstoned());
+        assert_eq!(room.tombstone_content().unwrap().body.as_deref(), Some("Room closed"));
+        assert!(room.successor_room().is_none());
+    }
+
+    #[async_test]
+    async fn test_tombstone_with_empty_replacement_room() {
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r0");
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        let response = SyncResponseBuilder::new()
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    tombstone_without_successor(json!({ "body": "", "replacement_room": "" }))
+                        .cast_unchecked(),
+                ),
+            )
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        assert!(room.is_tombstoned());
+        assert!(room.successor_room().is_none());
+    }
+
+    #[async_test]
+    async fn test_invited_room_tombstone_without_replacement_room() {
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r0");
+
+        let response = SyncResponseBuilder::new()
+            .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
+                tombstone_without_successor(json!({ "body": "Room closed" })).cast_unchecked(),
+            ))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+        assert!(room.is_tombstoned());
         assert!(room.successor_room().is_none());
     }
 
