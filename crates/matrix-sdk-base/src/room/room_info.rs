@@ -414,9 +414,24 @@ impl BaseRoomInfo {
                 }
             }
             (StateEventType::RoomTombstone, "") => {
-                if let Some(event) = raw_event.deserialize_as_minimal_event(|any_event| {
-                    as_variant!(any_event, AnyPossiblyRedactedStateEventContent::RoomTombstone)
-                }) {
+                if let Some(event) = raw_event
+                    .deserialize_as_minimal_event(|any_event| {
+                        as_variant!(any_event, AnyPossiblyRedactedStateEventContent::RoomTombstone)
+                    })
+                    .or_else(|| {
+                        let mut content =
+                            raw_event.raw.get_field::<serde_json::Value>("content").ok()??;
+                        if content.get("replacement_room").and_then(serde_json::Value::as_str)
+                            == Some("")
+                        {
+                            content.as_object_mut()?.remove("replacement_room");
+                        }
+                        Some(MinimalStateEvent {
+                            content: serde_json::from_value(content).ok()?,
+                            event_id: raw_event.raw.get_field("event_id").ok()?,
+                        })
+                    })
+                {
                     self.tombstone = Some(event);
                     true
                 } else {
