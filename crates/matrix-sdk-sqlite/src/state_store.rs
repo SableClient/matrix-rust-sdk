@@ -581,6 +581,15 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, format!("presence:{user_id}"))
     }
 
+    /// Custom values written before they were encrypted are still stored as
+    /// is.
+    fn decode_custom_value(&self, value: Vec<u8>) -> Vec<u8> {
+        match self.decode_value(&value) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => value,
+        }
+    }
+
     fn encode_custom_key(&self, key: &[u8]) -> Key {
         let mut full_key = b"custom:".to_vec();
         full_key.extend(key);
@@ -2091,13 +2100,14 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.read().await?.get_kv_blob(self.encode_custom_key(key)).await
+        let value = self.read().await?.get_kv_blob(self.encode_custom_key(key)).await?;
+        Ok(value.map(|value| self.decode_custom_value(value)))
     }
 
     async fn set_custom_value_no_read(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
         let conn = self.write().await?;
         let key = self.encode_custom_key(key);
-        conn.set_kv_blob(key, value).await?;
+        conn.set_kv_blob(key, self.encode_value(value)?).await?;
         Ok(())
     }
 
@@ -2105,8 +2115,8 @@ impl StateStore for SqliteStateStore {
         let conn = self.write().await?;
         let key = self.encode_custom_key(key);
         let previous = conn.get_kv_blob(key.clone()).await?;
-        conn.set_kv_blob(key, value).await?;
-        Ok(previous)
+        conn.set_kv_blob(key, self.encode_value(value)?).await?;
+        Ok(previous.map(|value| self.decode_custom_value(value)))
     }
 
     async fn remove_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -2116,7 +2126,7 @@ impl StateStore for SqliteStateStore {
         if previous.is_some() {
             conn.delete_kv_blob(key).await?;
         }
-        Ok(previous)
+        Ok(previous.map(|value| self.decode_custom_value(value)))
     }
 
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
@@ -2831,7 +2841,7 @@ mod encrypted_tests {
     use matrix_sdk_test::async_test;
     use tempfile::{TempDir, tempdir};
 
-    use super::SqliteStateStore;
+    use super::{SqliteObjectStateStoreExt, SqliteStateStore};
     use crate::{Base64Variant, SqliteStoreConfig, Synchronous, utils::SqliteAsyncConnExt};
 
     static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
@@ -2850,6 +2860,36 @@ mod encrypted_tests {
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), Some("default_test_password"))
             .await
             .unwrap())
+    }
+
+    #[async_test]
+    async fn test_custom_values_are_encrypted_at_rest() {
+        let path = new_state_store_workspace();
+        let store = SqliteStateStore::open(&path, Some("default_test_password")).await.unwrap();
+        store.set_custom_value_no_read(b"fresh", b"secret value".to_vec()).await.unwrap();
+        store
+            .write()
+            .await
+            .unwrap()
+            .set_kv_blob(store.encode_custom_key(b"legacy"), b"stored as is".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_custom_value(b"fresh").await.unwrap().as_deref(),
+            Some(&b"secret value"[..])
+        );
+        assert_eq!(
+            store.get_custom_value(b"legacy").await.unwrap().as_deref(),
+            Some(&b"stored as is"[..])
+        );
+        store.close().await.unwrap();
+
+        let raw = rusqlite::Connection::open(path.join(super::DATABASE_NAME)).unwrap();
+        let mut statement = raw.prepare("SELECT value FROM kv_blob").unwrap();
+        let values: Vec<Vec<u8>> =
+            statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        assert!(!values.iter().any(|value| value.windows(12).any(|w| w == b"secret value")));
     }
 
     /// The two passphrase methods are interchangeable in both directions.
