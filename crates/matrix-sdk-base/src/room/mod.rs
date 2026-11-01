@@ -59,6 +59,7 @@ use ruma::{
             member::MembershipState,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource},
             retention::RoomRetentionEventContent,
+            topic::PossiblyRedactedRoomTopicEventContent,
         },
     },
     room::RoomType,
@@ -457,6 +458,11 @@ impl Room {
     /// Get the topic of the room.
     pub fn topic(&self) -> Option<String> {
         self.info.read().topic().map(ToOwned::to_owned)
+    }
+
+    /// Get the `m.room.topic` content of the room.
+    pub fn topic_content(&self) -> Option<PossiblyRedactedRoomTopicEventContent> {
+        self.info.read().topic_content().cloned()
     }
 
     /// Update the cached user defined notification mode.
