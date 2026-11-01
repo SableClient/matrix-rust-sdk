@@ -1158,6 +1158,11 @@ impl RoomInfo {
         self.base_info.topic.as_ref()?.content.topic.as_deref()
     }
 
+    /// Returns the content of the `m.room.topic` event, if any.
+    pub fn topic_content(&self) -> Option<&PossiblyRedactedRoomTopicEventContent> {
+        Some(&self.base_info.topic.as_ref()?.content)
+    }
+
     /// Get a list of all the valid (non expired) matrixRTC memberships and
     /// associated UserId's in this room.
     ///
