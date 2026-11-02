@@ -524,3 +524,43 @@ async fn test_start_round_trips_the_pickle_key_through_secret_storage() {
 
     dehydrated.stop();
 }
+
+#[async_test]
+async fn test_resume_without_a_cached_key_does_nothing() {
+    let server = MatrixMockServer::new().await;
+    let client = alice_client(&server).await;
+
+    let mut events = client.encryption().dehydrated_devices().state_stream();
+    assert!(!client.encryption().dehydrated_devices().resume().await.unwrap());
+    assert!(events.next().now_or_never().is_none());
+}
+
+#[async_test]
+async fn test_resume_rehydrates_and_uploads_with_the_cached_key() {
+    let server = MatrixMockServer::new().await;
+    let client = alice_client(&server).await;
+    bootstrap_cross_signing(&client).await;
+    mock_stateful_account_data(&server).await;
+    let captured = capture_uploaded_device(&server).await;
+
+    let secret_store = client.encryption().secret_storage().create_secret_store().await.unwrap();
+
+    let dehydrated = client.encryption().dehydrated_devices();
+    let mut events = dehydrated.state_stream();
+
+    dehydrated.start(&secret_store).await.unwrap();
+    let first_id = next_uploaded_device_id(&mut events).await;
+    dehydrated.stop();
+
+    let (uploaded_id, uploaded_data) =
+        captured.lock().unwrap().clone().expect("PUT mock recorded the upload");
+    server.mock_get_dehydrated_device().ok(&uploaded_id, uploaded_data).mock_once().mount().await;
+    server.mock_dehydrated_device_events().ok(vec![], None).mock_once().mount().await;
+    server.mock_delete_dehydrated_device().ok(&uploaded_id).mock_once().mount().await;
+
+    assert!(dehydrated.resume().await.unwrap());
+    let second_id = next_uploaded_device_id(&mut events).await;
+    assert_ne!(second_id, first_id, "resume must upload a fresh dehydrated device");
+
+    dehydrated.stop();
+}
