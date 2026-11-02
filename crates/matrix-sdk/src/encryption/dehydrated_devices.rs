@@ -652,17 +652,44 @@ impl DehydratedDevices {
         self.state().rotation_task.lock().take();
     }
 
+    /// Resume dehydrated devices with the pickle key cached by an earlier
+    /// [`Self::start`], without unlocking Secret Storage.
+    ///
+    /// Meant for a client restart: rehydrates the existing device, uploads a
+    /// fresh one and schedules rotation, like [`Self::start`] does. Returns
+    /// `Ok(false)` without contacting the server when no pickle key is cached.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # async fn example(client: Client) -> anyhow::Result<()> {
+    /// client.encryption().dehydrated_devices().resume().await?;
+    /// # Ok(()) }
+    /// ```
+    #[instrument(skip_all)]
+    pub async fn resume(&self) -> Result<bool, DehydratedDeviceError> {
+        let Some(key) = self.cached_key().await? else { return Ok(false) };
+
+        self.stop();
+
+        if let Err(e) = self.rehydrate(&key).await {
+            let msg = e.to_string();
+            warn!(error = %e, "Rehydration failed during resume; continuing");
+            self.emit(DehydratedDeviceEvent::RehydrationError { error: msg });
+        }
+
+        self.schedule_dehydration(&key).await?;
+        Ok(true)
+    }
+
     /// Create-and-upload the first dehydrated device now, then spawn the
     /// rotation loop.
     async fn schedule_dehydration(
         &self,
-        secret_store: &SecretStore,
+        key: &DehydratedDeviceKey,
     ) -> Result<(), DehydratedDeviceError> {
-        let key = self
-            .load_key(secret_store, true)
-            .await?
-            .expect("load_key(create_if_missing=true) always yields a key");
-        self.create(None, &key).await?;
+        self.create(None, key).await?;
 
         let weak_client = self.client.downgrade();
         let handle = self
@@ -959,7 +986,11 @@ impl<'a> IntoFuture for StartDehydration<'a> {
                 }
             }
 
-            devices.schedule_dehydration(secret_store).await
+            let key = devices
+                .load_key(secret_store, true)
+                .await?
+                .expect("load_key(create_if_missing=true) always yields a key");
+            devices.schedule_dehydration(&key).await
         };
 
         Box::pin(future.instrument(tracing_span))
