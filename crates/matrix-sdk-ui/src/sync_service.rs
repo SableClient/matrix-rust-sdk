@@ -295,6 +295,7 @@ impl SyncTaskSupervisor {
                 if stop_room_list {
                     if let Err(err) = room_list_service.stop_sync() {
                         warn!(?report, "unable to stop room list service: {err:#}");
+                        room_list_task.abort();
                     }
 
                     if report.has_expired() {
@@ -309,6 +310,7 @@ impl SyncTaskSupervisor {
                 if stop_encryption {
                     if let Err(err) = encryption_sync.stop_sync() {
                         warn!(?report, "unable to stop encryption sync: {err:#}");
+                        encryption_sync_task.abort();
                     }
 
                     if report.has_expired() {
