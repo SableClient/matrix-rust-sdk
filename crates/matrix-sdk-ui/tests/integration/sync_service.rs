@@ -63,6 +63,28 @@ async fn setup_mocking_sliding_sync_server(
 }
 
 #[async_test]
+async fn test_sync_service_can_stop_immediately_after_starting() -> anyhow::Result<()> {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let _guard = setup_mocking_sliding_sync_server(
+        &server,
+        Arc::new(Mutex::new(0)),
+        Arc::new(Mutex::new(0)),
+    )
+    .await;
+    let sync_service = SyncService::builder(client).build().await?;
+
+    for _ in 0..3 {
+        sync_service.start().await;
+        matrix_sdk::timeout::timeout(sync_service.stop(), Duration::from_secs(2)).await?;
+        assert_matches!(sync_service.state().get(), State::Idle);
+        assert!(!sync_service.is_supervisor_running().await);
+        assert!(sync_service.try_get_encryption_sync_permit().is_some());
+    }
+    Ok(())
+}
+
+#[async_test]
 async fn test_sync_service_state() -> anyhow::Result<()> {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
