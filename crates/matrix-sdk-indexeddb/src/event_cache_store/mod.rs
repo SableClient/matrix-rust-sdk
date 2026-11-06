@@ -94,6 +94,7 @@ impl IndexeddbEventCacheStore {
             self.inner
                 .transaction(stores)
                 .with_mode(mode)
+                .with_options(crate::transaction::cache_transaction_options(mode))
                 .build()
                 .map_err(TransactionError::from)?,
             &self.serializer,

@@ -38,6 +38,19 @@ use crate::{
     },
 };
 
+/// Options for transactions on the event cache and media stores.
+///
+/// Their content can be fetched again from the homeserver, so writes trade
+/// the flush to disk for speed. Browsers that predate the `durability` option
+/// ignore it.
+pub(crate) fn cache_transaction_options(mode: inner::TransactionMode) -> inner::TransactionOptions {
+    let mut options = inner::TransactionOptions::new();
+    if mode == inner::TransactionMode::Readwrite {
+        options.set_durability(inner::TransactionDurability::Relaxed);
+    }
+    options
+}
+
 #[derive(Debug, Error)]
 pub enum TransactionError {
     #[error("DomException {name} ({code}): {message}")]
@@ -638,5 +651,24 @@ impl<'a> Transaction<'a> {
     {
         self.transaction.object_store(T::OBJECT_STORE)?.clear()?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use indexed_db_futures::transaction::{TransactionDurability, TransactionMode};
+    use matrix_sdk_test::async_test;
+
+    use super::cache_transaction_options;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[async_test]
+    async fn test_cache_writes_are_relaxed_and_reads_keep_the_default() {
+        assert_eq!(
+            cache_transaction_options(TransactionMode::Readwrite).durability(),
+            Some(TransactionDurability::Relaxed)
+        );
+        assert_eq!(cache_transaction_options(TransactionMode::Readonly).durability(), None);
     }
 }
