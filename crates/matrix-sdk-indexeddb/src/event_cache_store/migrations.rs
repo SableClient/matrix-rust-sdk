@@ -653,8 +653,9 @@ pub mod v10 {
 }
 
 pub mod v11 {
-    use super::*;
     use indexed_db_futures::Build;
+
+    use super::*;
 
     pub mod keys {
         pub use super::v10::keys::*;
@@ -676,12 +677,13 @@ pub mod v11 {
 
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
-    use super::*;
     use gloo_utils::format::JsValueSerdeExt;
     use indexed_db_futures::{prelude::*, transaction::TransactionMode};
     use matrix_sdk_test::async_test;
     use serde_json::json;
     use wasm_bindgen::JsValue;
+
+    use super::*;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
