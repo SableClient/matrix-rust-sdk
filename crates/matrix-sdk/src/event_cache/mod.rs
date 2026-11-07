@@ -692,7 +692,9 @@ impl EventCacheInner {
         let mut caches_for_all_rooms = self.by_room.write().await;
         self.state.clear_and_reload(&caches_for_all_rooms, Some(room_id)).await?;
 
-        // Finally, we forget all the caches if any exists in memory.
+        // Finally, we forget all the caches if any exists in memory, with their
+        // states.
+        self.state.remove_room(&caches_for_all_rooms, room_id).await;
         caches_for_all_rooms.remove(room_id);
 
         Ok(())
@@ -1208,5 +1210,20 @@ mod tests {
 
         // Creating room B's caches again works.
         event_cache.room(room_id_b).await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_room_caches_can_be_recreated_after_forget_room() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+
+        let event_cache = client.event_cache().unwrap();
+
+        event_cache.room(room_id).await.unwrap();
+        event_cache.forget_room(room_id).await.unwrap();
+
+        event_cache.room(room_id).await.unwrap();
     }
 }
