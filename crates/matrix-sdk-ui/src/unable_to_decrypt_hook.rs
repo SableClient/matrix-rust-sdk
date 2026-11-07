@@ -377,6 +377,10 @@ impl UtdHookManager {
         let event_id = info.event_id.clone();
         parent_hook.on_utd(info);
         reported_utds_lock.insert(event_id);
+
+        // The stores are closed while the client is paused.
+        client.wait_until_resumed().await;
+
         if let Err(e) = client
             .state_store()
             .set_kv_data(
@@ -415,6 +419,7 @@ mod tests {
     use matrix_sdk::test_utils::{logged_in_client, no_retry_test_client};
     use matrix_sdk_test::async_test;
     use ruma::{event_id, owned_server_name, user_id};
+    use tokio::spawn;
 
     use super::*;
 
@@ -546,6 +551,55 @@ mod tests {
             assert_eq!(utds.len(), 1);
             assert_eq!(utds[0].event_id, "$3");
         }
+    }
+
+    #[async_test]
+    async fn test_defers_persisting_while_paused() {
+        let client = no_retry_test_client(None).await;
+        let hook = Arc::new(Dummy::default());
+        let wrapper = Arc::new(UtdHookManager::new(hook.clone(), client.clone()));
+
+        client.pause().await.unwrap();
+
+        let reporting = spawn({
+            let wrapper = wrapper.clone();
+            async move {
+                wrapper
+                    .on_utd(
+                        event_id!("$1"),
+                        UtdCause::Unknown,
+                        MilliSecondsSinceUnixEpoch::now(),
+                        user_id!("@a:b"),
+                    )
+                    .await;
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        // The parent hook was told, but nothing was written to the store.
+        assert_eq!(hook.utds.lock().unwrap().len(), 1);
+        assert!(!reporting.is_finished());
+        assert!(
+            client
+                .state_store()
+                .get_kv_data(StateStoreDataKey::UtdHookManagerData)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        client.resume().await.unwrap();
+        reporting.await.unwrap();
+
+        assert!(
+            client
+                .state_store()
+                .get_kv_data(StateStoreDataKey::UtdHookManagerData)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Test that UTD events which had not yet been reported in a previous
