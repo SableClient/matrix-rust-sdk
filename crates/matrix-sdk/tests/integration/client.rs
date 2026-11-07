@@ -1640,6 +1640,52 @@ async fn test_client_pause_waits_for_held_state_store_write() {
 }
 
 #[async_test]
+#[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
+async fn test_client_pause_defers_store_lock_acquisition() {
+    let tempdir = tempdir().unwrap();
+
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .sqlite_store(tempdir.path(), None)
+                .cross_process_store_config(CrossProcessLockConfig::multi_process("test"))
+        })
+        .build()
+        .await;
+
+    client.encryption().enable_cross_process_store_lock("test".to_owned()).await.unwrap();
+
+    // Release the locks right before pausing, so their lease renewal is due.
+    drop(client.event_cache_store().lock().await.unwrap());
+    drop(client.media_store().lock().await.unwrap());
+    drop(client.encryption().spin_lock_store(None).await.unwrap());
+
+    client.pause().await.unwrap();
+
+    let waiting = spawn({
+        let client = client.clone();
+        async move {
+            drop(client.event_cache_store().lock().await.unwrap());
+            drop(client.media_store().lock().await.unwrap());
+            drop(client.encryption().spin_lock_store(None).await.unwrap());
+        }
+    });
+
+    // The closed stores aren't reached, the acquisitions wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "locking while paused should wait for the resume");
+
+    client.resume().await.unwrap();
+
+    timeout(Duration::from_secs(3), waiting)
+        .await
+        .expect("locking should go through after the resume")
+        .unwrap();
+}
+
+#[async_test]
 async fn test_logout() {
     let server = MatrixMockServer::new().await;
 
