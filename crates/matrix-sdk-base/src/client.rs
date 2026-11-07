@@ -1338,6 +1338,25 @@ impl BaseClient {
         Ok(result)
     }
 
+    /// Release the cross-process locks of the stores and make acquiring them
+    /// wait until [`BaseClient::resume_locks`].
+    ///
+    /// Call this before [`BaseClient::close_stores`], so that no lock lease
+    /// renewal or lock acquisition reaches a closed store.
+    pub async fn suspend_locks(&self) {
+        futures_util::future::join(
+            self.event_cache_store.suspend(),
+            self.media_store.suspend(),
+        )
+        .await;
+    }
+
+    /// Undo [`BaseClient::suspend_locks`], after [`BaseClient::reopen_stores`].
+    pub async fn resume_locks(&self) {
+        self.event_cache_store.resume().await;
+        self.media_store.resume().await;
+    }
+
     /// Close all stores, releasing database connections and file locks.
     ///
     /// In-flight operations will complete before this returns.
