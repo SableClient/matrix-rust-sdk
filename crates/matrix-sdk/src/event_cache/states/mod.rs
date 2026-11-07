@@ -282,6 +282,19 @@ impl StateLock {
         Ok(())
     }
 
+    /// Remove all the cache states of a room, so that its caches can be
+    /// created again.
+    ///
+    /// The `caches_for_all_rooms_exclusive_lock_guard` argument ensures the
+    /// room's caches are removed at the same time.
+    pub(super) async fn remove_room(
+        &self,
+        _caches_for_all_rooms_exclusive_lock_guard: &RwLockWriteGuard<'_, CachesByRoom>,
+        room_id: &RoomId,
+    ) {
+        self.inner.locked_state.write().await.by_room.remove(room_id);
+    }
+
     /// Insert a new cache state at location `cache_state_selector` if none
     /// exists.
     ///
