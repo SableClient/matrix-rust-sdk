@@ -92,7 +92,9 @@ use ruma::{
     time::Instant,
 };
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, OnceCell, RwLock, RwLockReadGuard, broadcast, mpsc::unbounded_channel};
+use tokio::sync::{
+    Mutex, OnceCell, RwLock, RwLockReadGuard, broadcast, mpsc::unbounded_channel, watch,
+};
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 use url::Url;
 
@@ -457,6 +459,9 @@ pub(crate) struct ClientInner {
     /// A monitor for background tasks spawned by the client.
     pub(crate) task_monitor: TaskMonitor,
 
+    /// Whether the client is paused, see [`Client::pause`].
+    paused: watch::Sender<bool>,
+
     /// A sender to notify subscribers about duplicate key upload errors
     /// triggered by requests to /keys/upload.
     #[cfg(feature = "e2e-encryption")]
@@ -551,6 +556,7 @@ impl ClientInner {
             #[cfg(feature = "unstable-msc4536")]
             global_profile_fetcher: StdOnceLock::new(),
             task_monitor: TaskMonitor::new(),
+            paused: watch::Sender::new(false),
             #[cfg(feature = "e2e-encryption")]
             duplicate_key_upload_error_sender: broadcast::channel(1).0,
             media_fetcher: RwLock::new(media_fetcher),
@@ -4195,7 +4201,10 @@ impl Client {
     /// This method:
     ///
     /// 1. Disables all send queues (prevents new message sends).
-    /// 2. Pauses all database stores, waiting for in-flight operations and
+    /// 2. Releases the cross-process locks, and makes taking them wait until
+    ///    [`Client::resume()`], so that no lock lease renewal or lock
+    ///    acquisition reaches a closed store.
+    /// 3. Pauses all database stores, waiting for in-flight operations and
     ///    releasing all connections and file locks.
     ///
     /// Call [`Client::resume()`] when the app returns to the foreground.
@@ -4212,6 +4221,21 @@ impl Client {
 
         // Disable send queues so no new sends hit the stores.
         self.send_queue().set_enabled(false).await;
+
+        self.inner.paused.send_replace(true);
+
+        // Stop the lock lease renewals and the lock acquisitions first: they
+        // would fail on the closed stores.
+        #[cfg(feature = "e2e-encryption")]
+        let crypto_store_lock = self.locks().cross_process_crypto_store_lock.get();
+        #[cfg(feature = "e2e-encryption")]
+        futures_util::future::join(
+            self.base_client().suspend_locks(),
+            OptionFuture::from(crypto_store_lock.map(|lock| lock.suspend())),
+        )
+        .await;
+        #[cfg(not(feature = "e2e-encryption"))]
+        self.base_client().suspend_locks().await;
 
         // Close all stores (waits for in-flight ops, closes connections).
         self.base_client().close_stores().await?;
@@ -4233,11 +4257,28 @@ impl Client {
         // Reopen stores (creates new connection pools).
         self.base_client().reopen_stores().await?;
 
+        self.base_client().resume_locks().await;
+        #[cfg(feature = "e2e-encryption")]
+        if let Some(lock) = self.locks().cross_process_crypto_store_lock.get() {
+            lock.resume().await;
+        }
+
+        self.inner.paused.send_replace(false);
+
         // Re-enable send queues.
         self.send_queue().set_enabled(true).await;
 
         info!("Client::resume — complete");
         Ok(())
+    }
+
+    /// Wait until the client is not paused, see [`Client::pause()`].
+    ///
+    /// Background tasks that need the stores can use this to defer their work
+    /// until [`Client::resume()`] instead of failing on closed stores.
+    pub async fn wait_until_resumed(&self) {
+        // The sender lives in `self.inner`, so the channel can't close.
+        let _ = self.inner.paused.subscribe().wait_for(|paused| !*paused).await;
     }
 
     /// Perform database optimizations if any are available, i.e. vacuuming in
