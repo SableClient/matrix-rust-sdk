@@ -47,13 +47,14 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     SendOutsideWasm, SyncOutsideWasm,
     executor::{AbortOnDrop, JoinHandleExt, spawn},
     sleep::sleep,
+    timeout::timeout,
 };
 
 /// A lock generation is an integer incremented each time the lock is taken by a
@@ -260,6 +261,9 @@ struct CrossProcessLockInner {
     /// See [`CrossProcessLockState::Dirty`] to learn more about the semantics
     /// of _dirty_.
     is_dirty: AtomicBool,
+
+    /// Whether the lock is suspended, see [`CrossProcessLock::suspend`].
+    suspended: watch::Sender<bool>,
 }
 
 impl CrossProcessLockInner {
@@ -290,6 +294,10 @@ pub const LEASE_DURATION_MS: u32 = 500;
 /// `LEASE_DURATION_MS`, to make sure that we can miss a deadline without
 /// compromising the lock.
 pub const EXTEND_LEASE_EVERY_MS: u64 = 50;
+
+/// How long [`CrossProcessLock::suspend`] waits for the current holders to
+/// release the lock.
+const SUSPEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Initial backoff, in milliseconds. This is the time we wait the first time,
 /// if taking the lock initially failed.
@@ -334,6 +342,7 @@ where
                 generation: AtomicU64::new(NO_CROSS_PROCESS_LOCK_GENERATION),
 
                 is_dirty: AtomicBool::new(false),
+                suspended: watch::Sender::new(false),
             }),
             backoff: Arc::new(Mutex::new(WaitingTime::Some(INITIAL_BACKOFF_MS))),
             config,
@@ -376,13 +385,22 @@ where
     pub async fn try_lock_once(&self) -> AcquireCrossProcessLockResult<L::LockError> {
         // If it's not `MultiProcess`, this behaves as a no-op
         let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config else {
+            self.wait_until_resumed().await;
             let guard = CrossProcessLockGuard::new(&self.inner);
             return Ok(Ok(CrossProcessLockState::Clean(guard)));
         };
 
         // Hold onto the locking attempt mutex for the entire lifetime of this
         // function, to avoid multiple reentrant calls.
-        let mut _attempt = self.locking_attempt.lock().await;
+        let mut _attempt = loop {
+            self.wait_until_resumed().await;
+            let attempt = self.locking_attempt.lock().await;
+
+            // `suspend` may have run between the wait and the mutex.
+            if !*self.inner.suspended.borrow() {
+                break attempt;
+            }
+        };
 
         // If there is at least one other holder, it means the lock has already
         // been acquired, and we can safely generate a new guard.
@@ -400,6 +418,93 @@ where
             return Ok(Ok(CrossProcessLockState::Clean(CrossProcessLockGuard::new(&self.inner))));
         }
 
+        if let Err(unobtained) = self.acquire(holder_name).await? {
+            return Ok(Err(unobtained));
+        }
+
+        let guard = CrossProcessLockGuard::new(&self.inner);
+
+        Ok(Ok(if self.is_dirty() {
+            CrossProcessLockState::Dirty(guard)
+        } else {
+            CrossProcessLockState::Clean(guard)
+        }))
+    }
+
+    async fn wait_until_resumed(&self) {
+        // The sender lives in `self.inner`, so the channel can't close.
+        let _ = self.inner.suspended.subscribe().wait_for(|suspended| !*suspended).await;
+    }
+
+    /// Release the lock in the store and stop renewing its lease, so that the
+    /// store can be closed without a background task touching it.
+    ///
+    /// New acquisitions wait until [`CrossProcessLock::resume`] is called
+    /// rather than reaching the closed store. Current holders get a few
+    /// seconds to drop their guards first.
+    pub async fn suspend(&self) {
+        self.inner.suspended.send_replace(true);
+
+        if timeout(
+            async {
+                while Self::count_holders(&self.inner) > 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            },
+            SUSPEND_DRAIN_TIMEOUT,
+        )
+        .await
+        .is_err()
+        {
+            warn!("Suspending the lock while it is still held");
+        }
+
+        let _attempt = self.locking_attempt.lock().await;
+
+        // Dropping the task aborts it.
+        let renew_task = self.inner.renew_task.lock().await.take();
+
+        if renew_task.is_some()
+            && let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config
+        {
+            drop(renew_task);
+
+            // Cancel the lease with another 0ms lease, like the renew task
+            // does when it exits.
+            let _ = self.locker.try_lock(0, &self.lock_key, holder_name).await;
+        }
+    }
+
+    /// Undo [`CrossProcessLock::suspend`].
+    ///
+    /// Call this once the store is open again. Guards that outlived the
+    /// suspension get their lease back and renewed.
+    pub async fn resume(&self) {
+        if let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config {
+            let _attempt = self.locking_attempt.lock().await;
+
+            if Self::count_holders(&self.inner) > 0 {
+                match self.acquire(holder_name).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(unobtained)) => {
+                        warn!("Couldn't take the lock back after resuming: {unobtained}");
+                    }
+                    Err(err) => warn!("Couldn't take the lock back after resuming: {err:#}"),
+                }
+            }
+        }
+
+        self.inner.suspended.send_replace(false);
+    }
+
+    /// Take the lock in the store and (re)start the task that renews its
+    /// lease.
+    ///
+    /// The caller must hold `locking_attempt`.
+    async fn acquire(
+        &self,
+        holder_name: &str,
+    ) -> Result<Result<(), CrossProcessLockUnobtained>, L::LockError> {
         if let Some(new_generation) =
             self.locker.try_lock(LEASE_DURATION_MS, &self.lock_key, holder_name).await?
         {
@@ -529,13 +634,7 @@ where
             .abort_on_drop(),
         );
 
-        let guard = CrossProcessLockGuard::new(&self.inner);
-
-        Ok(Ok(if self.is_dirty() {
-            CrossProcessLockState::Dirty(guard)
-        } else {
-            CrossProcessLockState::Clean(guard)
-        }))
+        Ok(Ok(()))
     }
 
     /// Attempt to take the lock, with exponential backoff if the lock has
@@ -743,7 +842,10 @@ mod tests {
     use std::{
         collections::HashMap,
         ops::Not,
-        sync::{Arc, RwLock},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -754,7 +856,8 @@ mod tests {
 
     use super::{
         CrossProcessLockConfig, CrossProcessLockError, CrossProcessLockGeneration,
-        CrossProcessLockGuard, CrossProcessLockState, CrossProcessLockUnobtained, TryLock,
+        CrossProcessLockGuard, CrossProcessLockState, CrossProcessLockUnobtained,
+        LEASE_DURATION_MS, TryLock,
         memory_store_helper::{Lease, try_take_leased_lock},
     };
 
@@ -1080,6 +1183,124 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("The store is closed")]
+    struct Closed;
+
+    /// A store that fails like a closed SQLite store and counts how often it
+    /// was reached while closed.
+    #[derive(Clone, Default)]
+    struct ClosableStore {
+        leases: TestStore,
+        closed: Arc<AtomicBool>,
+        calls_while_closed: Arc<AtomicUsize>,
+    }
+
+    impl TryLock for ClosableStore {
+        type LockError = Closed;
+
+        async fn try_lock(
+            &self,
+            lease_duration_ms: u32,
+            key: &str,
+            holder: &str,
+        ) -> Result<Option<CrossProcessLockGeneration>, Self::LockError> {
+            if self.closed.load(Ordering::SeqCst) {
+                self.calls_while_closed.fetch_add(1, Ordering::SeqCst);
+                return Err(Closed);
+            }
+
+            Ok(self.leases.try_take_leased_lock(lease_duration_ms, key, holder))
+        }
+    }
+
+    #[async_test]
+    async fn test_suspend_stops_touching_the_store() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store.clone(),
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+
+        // The last guard is dropped right before suspending, while the renew task
+        // is still waiting to extend the lease.
+        let guard = lock.try_lock_once().await.unwrap().expect("lock must be obtained");
+        drop(guard);
+
+        lock.suspend().await;
+        store.closed.store(true, Ordering::SeqCst);
+
+        sleep(Duration::from_millis(3 * super::EXTEND_LEASE_EVERY_MS)).await;
+        assert_eq!(store.calls_while_closed.load(Ordering::SeqCst), 0);
+
+        // The lease has been released, another holder doesn't have to wait for it
+        // to expire.
+        store.closed.store(false, Ordering::SeqCst);
+        let other = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("second"),
+        );
+        assert!(other.try_lock_once().await.unwrap().is_ok());
+    }
+
+    #[async_test]
+    async fn test_acquiring_waits_for_resume() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store.clone(),
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+
+        lock.suspend().await;
+        store.closed.store(true, Ordering::SeqCst);
+
+        let waiting = spawn({
+            let lock = lock.clone();
+            async move { lock.spin_lock(None).await.unwrap().unwrap().into_guard() }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+        assert!(waiting.is_finished().not());
+        assert_eq!(store.calls_while_closed.load(Ordering::SeqCst), 0);
+
+        store.closed.store(false, Ordering::SeqCst);
+        lock.resume().await;
+
+        let _guard = waiting.await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_resume_renews_the_lease_of_a_surviving_guard() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store.clone(),
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+        let _guard = lock.try_lock_once().await.unwrap().expect("lock must be obtained");
+
+        // The renew task gives up when the store fails.
+        store.closed.store(true, Ordering::SeqCst);
+        sleep(Duration::from_millis(3 * super::EXTEND_LEASE_EVERY_MS)).await;
+        store.closed.store(false, Ordering::SeqCst);
+
+        lock.resume().await;
+
+        sleep(Duration::from_millis(2 * u64::from(LEASE_DURATION_MS))).await;
+        let other = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("second"),
+        );
+        assert_matches!(
+            other.try_lock_once().await.unwrap(),
+            Err(CrossProcessLockUnobtained::Busy)
+        );
     }
 }
 
