@@ -482,7 +482,8 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
 
         trace!(number_of_subscribers, "received request to auto-shrink");
 
-        if number_of_subscribers == 0 {
+        // One chunk is already the shrunk state, so skip the store reload.
+        if number_of_subscribers == 0 && self.state.room_linked_chunk.chunks().nth(1).is_some() {
             // There is no more subscribers listening to this cache, we can
             // shrink the state to its last chunk to save memory.
             //
