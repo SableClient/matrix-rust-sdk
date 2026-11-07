@@ -139,6 +139,21 @@ impl MediaStoreLock {
         self.store.reopen().await
     }
 
+    /// Release the cross-process lock and make [`Self::lock`] wait until
+    /// [`Self::resume`], see [`CrossProcessLock::suspend`].
+    ///
+    /// Call this before [`Self::close`].
+    pub async fn suspend(&self) {
+        self.cross_process_lock.suspend().await;
+    }
+
+    /// Undo [`Self::suspend`], see [`CrossProcessLock::resume`].
+    ///
+    /// Call this after [`Self::reopen`].
+    pub async fn resume(&self) {
+        self.cross_process_lock.resume().await;
+    }
+
     /// Acquire a spin lock (see [`CrossProcessLock::spin_lock`]).
     pub async fn lock(&self) -> Result<MediaStoreLockGuard<'_>, CrossProcessLockError> {
         let cross_process_lock_guard = match self.cross_process_lock.spin_lock(None).await?? {
