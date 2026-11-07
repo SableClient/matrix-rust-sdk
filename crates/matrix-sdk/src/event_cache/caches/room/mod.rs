@@ -2022,6 +2022,65 @@ mod timed_tests {
     }
 
     #[async_test]
+    async fn test_auto_shrink_skips_a_single_chunk() {
+        let room_id = room_id!("!galette:saucisse.bzh");
+        let ev = EventFactory::new()
+            .room(room_id)
+            .text_msg("hello world")
+            .sender(User::Alice)
+            .event_id(event_id!("$1"))
+            .into_event();
+
+        let event_cache_store = ControlledMemoryStore::new();
+        event_cache_store
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![ev],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let client = MockClientBuilder::new(None)
+            .on_builder({
+                let event_cache_store = event_cache_store.clone();
+
+                move |builder| {
+                    builder.store_config(
+                        StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                            .event_cache_store(event_cache_store),
+                    )
+                }
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache().unwrap();
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
+
+        let (events, stream) = room_event_cache.subscribe().await.unwrap();
+        assert_eq!(events.len(), 1);
+
+        // A shrink would reload the last chunk, and this failure would clear
+        // it.
+        event_cache_store.fail_next_last_chunk_load();
+        drop(stream);
+        yield_now().await;
+
+        assert_eq!(room_event_cache.events().await.unwrap().len(), 1);
+    }
+
+    #[async_test]
     async fn test_rfind_map_event_in_memory_by() {
         let user_id = user_id!("@mnt_io:matrix.org");
         let room_id = room_id!("!raclette:patate.ch");
