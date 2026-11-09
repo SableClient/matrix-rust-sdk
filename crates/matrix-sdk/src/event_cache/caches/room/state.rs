@@ -706,6 +706,15 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 redecryptor::try_decrypt_in_place(&mut bundled_thread, room.as_ref()).await;
                 self.save_events([bundled_thread]).await?;
             }
+
+            // Bundled relations are stripped from stored events, so keep the
+            // edit as an event of its own.
+            #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_mut))]
+            if let Some(mut bundled_edit) = event.bundled_latest_edit() {
+                #[cfg(feature = "e2e-encryption")]
+                redecryptor::try_decrypt_in_place(&mut bundled_edit, room.as_ref()).await;
+                self.save_events([bundled_edit]).await?;
+            }
         }
 
         self.update_read_receipts(receipt_event).await?;

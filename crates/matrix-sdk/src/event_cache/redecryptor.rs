@@ -1268,7 +1268,7 @@ impl Redecryptor {
 }
 
 /// Helper method used by `RoomEventCacheState` and `ThreadEventCacheState` to
-/// attempt to decrypt a bundled thread event we haven't tried to decrypt yet.
+/// attempt to decrypt a bundled event we haven't tried to decrypt yet.
 pub(super) async fn try_decrypt_in_place(event: &mut TimelineEvent, room: Option<&Room>) {
     if let TimelineEventKind::UnableToDecrypt { utd_info, .. } = &event.kind
         && let Some(room) = room
@@ -1283,9 +1283,9 @@ pub(super) async fn try_decrypt_in_place(event: &mut TimelineEvent, room: Option
             .await
         {
             Ok(decrypted) => *event = decrypted,
-            Err(e) => warn!(
-                "Failed to decrypt a bundled thread event we haven't tried to decrypt yet {e:?}"
-            ),
+            Err(e) => {
+                warn!("Failed to decrypt a bundled event we haven't tried to decrypt yet {e:?}")
+            }
         }
     }
 }

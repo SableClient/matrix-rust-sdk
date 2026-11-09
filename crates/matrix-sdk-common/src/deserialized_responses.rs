@@ -34,7 +34,9 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     debug::{DebugRawEvent, DebugStructExt},
-    serde_helpers::{extract_bundled_thread, extract_is_thread_root, extract_timestamp},
+    serde_helpers::{
+        extract_bundled_edit, extract_bundled_thread, extract_is_thread_root, extract_timestamp,
+    },
 };
 
 const AUTHENTICITY_NOT_GUARANTEED: &str =
@@ -638,19 +640,21 @@ impl TimelineEvent {
         }
     }
 
-    /// Try to create a new [`TimelineEvent`] for the bundled latest thread
-    /// event, if we have enough information about the encryption status for it.
+    /// Try to create a new [`TimelineEvent`] for an event bundled at
+    /// `location`, if we have enough information about the encryption status
+    /// for it.
     fn from_bundled_latest_event(
         kind: &TimelineEventKind,
+        location: UnsignedEventLocation,
         latest_event: Raw<AnySyncMessageLikeEvent>,
         max_timestamp: MilliSecondsSinceUnixEpoch,
     ) -> Option<Self> {
         match kind {
             TimelineEventKind::Decrypted(decrypted) => {
-                if let Some(unsigned_decryption_result) =
-                    decrypted.unsigned_encryption_info.as_ref().and_then(|unsigned_map| {
-                        unsigned_map.get(&UnsignedEventLocation::RelationsThreadLatestEvent)
-                    })
+                if let Some(unsigned_decryption_result) = decrypted
+                    .unsigned_encryption_info
+                    .as_ref()
+                    .and_then(|unsigned_map| unsigned_map.get(&location))
                 {
                     match unsigned_decryption_result {
                         UnsignedDecryptionResult::Decrypted(encryption_info) => {
@@ -851,7 +855,20 @@ impl TimelineEvent {
 
         Self::from_bundled_latest_event(
             &self.kind,
+            UnsignedEventLocation::RelationsThreadLatestEvent,
             bundled_thread.latest_event,
+            self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
+        )
+    }
+
+    /// The latest edit bundled in this event, if any.
+    pub fn bundled_latest_edit(&self) -> Option<Self> {
+        let edit = extract_bundled_edit(self.raw())?;
+
+        Self::from_bundled_latest_event(
+            &self.kind,
+            UnsignedEventLocation::RelationsReplace,
+            edit,
             self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
         )
     }
@@ -877,6 +894,7 @@ impl TimelineEvent {
                 ),
                 Self::from_bundled_latest_event(
                     &self.kind,
+                    UnsignedEventLocation::RelationsThreadLatestEvent,
                     bundled_thread.latest_event,
                     self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
                 )?,
@@ -2125,6 +2143,7 @@ mod tests {
         };
         let result = TimelineEvent::from_bundled_latest_event(
             &kind,
+            UnsignedEventLocation::RelationsThreadLatestEvent,
             value.cast_unchecked(),
             MilliSecondsSinceUnixEpoch::now(),
         )
