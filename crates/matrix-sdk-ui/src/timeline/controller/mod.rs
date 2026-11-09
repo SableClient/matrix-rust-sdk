@@ -98,6 +98,7 @@ mod state_transaction;
 pub(super) use aggregations::*;
 pub(super) use decryption_retry_task::{CryptoDropHandles, spawn_crypto_tasks};
 use matrix_sdk_base::{CallIntentConsensus, RoomInfo};
+use matrix_sdk_common::serde_helpers::extract_relation;
 
 /// The outcome of [`TimelineController::should_send_receipt`].
 pub(super) enum SendReceiptDecision {
@@ -778,6 +779,83 @@ impl<P: RoomDataProvider> TimelineController<P> {
         state
             .handle_remote_aggregations(diffs, origin, &self.room_data_provider, &self.settings)
             .await
+    }
+
+    /// Applies the stored edits of `event_ids`.
+    pub(super) async fn apply_stored_edits(&self, event_ids: Vec<OwnedEventId>) {
+        let TimelineFocusKind::Live { event_cache, .. } = self.focus.deref() else {
+            return;
+        };
+        if event_ids.is_empty() {
+            return;
+        }
+
+        let lookups = event_ids.iter().map(|event_id| {
+            event_cache.find_event_with_relations(event_id, Some(vec![RelationType::Replacement]))
+        });
+        let edits: Vector<_> = match try_join_all(lookups).await {
+            Ok(found) => found.into_iter().flatten().flat_map(|(_, edits)| edits).collect(),
+            Err(err) => {
+                warn!("Failed to load stored edits: {err}");
+                return;
+            }
+        };
+
+        self.apply_edits(edits).await;
+    }
+
+    async fn apply_edits(&self, edits: Vector<TimelineEvent>) {
+        let edits: Vector<_> = {
+            let state = self.state.read().await;
+            let in_timeline = state.items.all_remote_events();
+            edits
+                .into_iter()
+                .filter(|edit| {
+                    edit.event_id().is_none_or(|event_id| {
+                        in_timeline.iter().all(|meta| meta.event_id != event_id)
+                            && state
+                                .meta
+                                .aggregations
+                                .is_aggregation_of(&TimelineEventItemId::EventId(
+                                    event_id.to_owned(),
+                                ))
+                                .is_none()
+                    })
+                })
+                .collect()
+        };
+
+        if !edits.is_empty() {
+            self.handle_remote_aggregations(
+                vec![VectorDiff::Append { values: edits }],
+                RemoteEventOrigin::Cache,
+            )
+            .await;
+        }
+    }
+
+    /// Applies the edits among the redecrypted `event_ids`.
+    pub(super) async fn apply_redecrypted_edits(&self, event_ids: BTreeSet<OwnedEventId>) {
+        let TimelineFocusKind::Live { event_cache, .. } = self.focus.deref() else {
+            return;
+        };
+
+        let lookups = event_ids.iter().map(|event_id| event_cache.find_event(event_id));
+        let edits: Vector<_> = match try_join_all(lookups).await {
+            Ok(found) => found
+                .into_iter()
+                .flatten()
+                .filter(|event| {
+                    matches!(extract_relation(event.raw()), Some((RelationType::Replacement, _)))
+                })
+                .collect(),
+            Err(err) => {
+                warn!("Failed to load redecrypted edits: {err}");
+                return;
+            }
+        };
+
+        self.apply_edits(edits).await;
     }
 
     /// Handle an update of the thread summary of a single event that is a
@@ -1534,8 +1612,10 @@ impl TimelineController {
                 let events = initial_live_events;
 
                 let has_events = !events.is_empty();
+                let edit_targets = edit_targets(&events);
 
                 self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
+                self.apply_stored_edits(edit_targets).await;
 
                 match event_cache.pagination().status().get() {
                     PaginationStatus::Idle { hit_timeline_start } => {
@@ -2046,6 +2126,18 @@ impl<P: RoomDataProvider> TimelineController<P> {
             .await
             .map_err(Into::into)
     }
+}
+
+pub(super) fn edit_targets<'a>(
+    events: impl IntoIterator<Item = &'a TimelineEvent>,
+) -> Vec<OwnedEventId> {
+    events
+        .into_iter()
+        .filter(|event| {
+            !matches!(extract_relation(event.raw()), Some((RelationType::Replacement, _)))
+        })
+        .filter_map(|event| event.event_id().map(ToOwned::to_owned))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

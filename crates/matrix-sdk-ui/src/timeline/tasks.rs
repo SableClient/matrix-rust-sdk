@@ -17,6 +17,7 @@
 use std::collections::BTreeSet;
 
 use eyeball::Subscriber as EyeballSubscriber;
+use eyeball_im::VectorDiff;
 use matrix_sdk::{
     event_cache::{
         EventFocusThreadMode, EventFocusedCache, EventsOrigin, PinnedEventsCache, RoomEventCache,
@@ -33,7 +34,9 @@ use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{error, instrument, trace, warn};
 
 use crate::timeline::{
-    TimelineController, TimelineFocus, controller::ActiveCallInfo, event_item::RemoteEventOrigin,
+    TimelineController, TimelineFocus,
+    controller::{ActiveCallInfo, edit_targets},
+    event_item::RemoteEventOrigin,
     traits::RoomDataProvider,
 };
 
@@ -73,9 +76,11 @@ pub(in crate::timeline) async fn pinned_events_task(
                     }
                 };
 
+                let edit_targets = edit_targets(&initial_events);
                 timeline_controller
                     .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
                     .await;
+                timeline_controller.apply_stored_edits(edit_targets).await;
 
                 continue;
             }
@@ -268,7 +273,9 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                 let has_diffs = !diffs.is_empty();
 
                 if matches!(timeline_focus, TimelineFocus::Live { .. }) {
+                    let edit_targets = edit_targets(diffs.iter().flat_map(diff_values));
                     timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
+                    timeline_controller.apply_stored_edits(edit_targets).await;
                 } else if matches!(timeline_focus, TimelineFocus::Event { .. }) {
                     // Only handle the remote aggregation for an event-focused
                     // timeline.
@@ -393,5 +400,20 @@ pub(in crate::timeline) async fn rtc_membership_update_task(
             prev_info = active_call.clone();
             timeline_controller.handle_active_call_update(active_call).await;
         }
+    }
+}
+
+fn diff_values<T>(diff: &VectorDiff<T>) -> Vec<&T> {
+    match diff {
+        VectorDiff::Append { values } | VectorDiff::Reset { values } => values.iter().collect(),
+        VectorDiff::PushFront { value }
+        | VectorDiff::PushBack { value }
+        | VectorDiff::Insert { value, .. } => vec![value],
+        VectorDiff::Set { .. }
+        | VectorDiff::Clear
+        | VectorDiff::PopFront
+        | VectorDiff::PopBack
+        | VectorDiff::Remove { .. }
+        | VectorDiff::Truncate { .. } => Vec::new(),
     }
 }
