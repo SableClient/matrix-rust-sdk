@@ -105,6 +105,21 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomRetention, ""),
 ];
 
+/// `m.bridge` (MSC2346) and its older name. Custom event types cannot be built
+/// in a `const`, so they cannot join `DEFAULT_REQUIRED_STATE`.
+const BRIDGE_REQUIRED_STATE: &[(&str, &str)] = &[("m.bridge", "*"), ("uk.half-shot.bridge", "*")];
+
+fn default_required_state() -> impl Iterator<Item = (StateEventType, String)> {
+    DEFAULT_REQUIRED_STATE
+        .iter()
+        .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
+        .chain(
+            BRIDGE_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                (StateEventType::from(*state_event), (*value).to_owned())
+            }),
+        )
+}
+
 /// The default `required_state` constant value for sliding sync room
 /// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
 const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
@@ -233,12 +248,7 @@ impl RoomListService {
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
                     .timeline_limit(timeline_limit)
-                    .required_state(
-                        DEFAULT_REQUIRED_STATE
-                            .iter()
-                            .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
-                            .collect(),
-                    )
+                    .required_state(default_required_state().collect())
                     .filters(Some(assign!(http::request::ListFilters::default(), {
                         // As defined in the [SlidingSync MSC] If unset, both
                         // invited and joined rooms are returned. If false, no
@@ -559,9 +569,7 @@ impl RoomListService {
 
 fn room_subscription_settings() -> http::request::RoomSubscription {
     assign!(http::request::RoomSubscription::default(), {
-        required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
-            (state_event.clone(), (*value).to_owned())
-        })
+        required_state: default_required_state()
         .chain(
             DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
                 (state_event.clone(), (*value).to_owned())
