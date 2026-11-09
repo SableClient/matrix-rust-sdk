@@ -117,6 +117,22 @@ struct ThreadRelation<BundledThread> {
     thread: Option<BundledThread>,
 }
 
+#[derive(Deserialize)]
+struct ReplaceRelation {
+    #[serde(rename = "m.replace")]
+    replace: Option<Raw<AnySyncMessageLikeEvent>>,
+}
+
+/// Try to extract the bundled latest edit of a timeline event, if available.
+pub fn extract_bundled_edit(
+    event: &Raw<AnySyncTimelineEvent>,
+) -> Option<Raw<AnySyncMessageLikeEvent>> {
+    match event.get_field::<UnsignedRelations<ReplaceRelation>>("unsigned") {
+        Ok(Some(UnsignedRelations { relations: Some(ReplaceRelation { replace }) })) => replace,
+        Ok(_) | Err(_) => None,
+    }
+}
+
 /// Try to extract a bundled thread of a timeline event, if available.
 pub fn extract_bundled_thread(event: &Raw<AnySyncTimelineEvent>) -> Option<BundledThread> {
     extract_thread_relation::<BundledThread>(event)

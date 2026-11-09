@@ -47,6 +47,7 @@ use sliding_sync::assert_timeline_stream;
 use strass::assert_let;
 use stream_assert::assert_pending;
 
+mod bundled_edit;
 mod decryption;
 mod echo;
 mod edit;
