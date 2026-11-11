@@ -13,6 +13,7 @@
 // limitations under the License
 
 use indexed_db_futures::{
+    Build,
     database::Database,
     error::{DomException, Error, OpenDbError},
     transaction::Transaction,
@@ -31,6 +32,28 @@ pub mod current {
 /// if necessary.
 #[allow(unused)]
 pub async fn open_and_upgrade_db(name: &str) -> Result<Database, OpenDbError> {
+    let db = open_and_upgrade(name).await?;
+    if !lacks_current_indexes(&db) {
+        return Ok(db);
+    }
+    // A Sable build numbered its own schema v11, so the upstream v11 never ran
+    // on it. The event cache refills from the server, so start it over.
+    db.close();
+    Database::delete_by_name(name)?.await?;
+    open_and_upgrade(name).await
+}
+
+fn lacks_current_indexes(db: &Database) -> bool {
+    let Ok(transaction) = db.transaction(current::keys::EVENTS).build() else {
+        return false;
+    };
+    let Ok(events) = transaction.object_store(current::keys::EVENTS) else {
+        return false;
+    };
+    !events.index_names().any(|name| name == current::keys::EVENTS_STATE_KEY_TIMESTAMP)
+}
+
+async fn open_and_upgrade(name: &str) -> Result<Database, OpenDbError> {
     Database::open(name)
         .with_version(current::VERSION as u32)
         .with_on_upgrade_needed(|event, transaction| {
@@ -696,5 +719,52 @@ pub mod v11 {
         threads.clear()?;
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_family = "wasm"))]
+mod tests {
+    use gloo_utils::format::JsValueSerdeExt;
+    use indexed_db_futures::{prelude::*, transaction::TransactionMode};
+    use matrix_sdk_test::async_test;
+    use serde_json::json;
+    use wasm_bindgen::JsValue;
+
+    use super::*;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[async_test]
+    async fn test_a_sable_numbered_v11_is_started_over() {
+        let name = "sable_numbered_v11";
+        let db = Database::open(name)
+            .with_version(Version::V11 as u32)
+            .with_on_upgrade_needed(|event, transaction| {
+                let mut version = Version::try_from(event.old_version() as u32)?;
+                while version < Version::V10 {
+                    version = version.upgrade(transaction)?.unwrap();
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let transaction = db
+            .transaction(v10::keys::EVENTS)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .unwrap();
+        let event =
+            JsValue::from_serde(&json!({ "id": ["chunk", "event"], "content": "" })).unwrap();
+        transaction.object_store(v10::keys::EVENTS).unwrap().put(&event).build().unwrap();
+        transaction.commit().await.unwrap();
+        db.close();
+
+        let db = open_and_upgrade_db(name).await.unwrap();
+
+        assert_eq!(db.version(), Version::V11 as u32 as f64);
+        let transaction = db.transaction(v11::keys::EVENTS).build().unwrap();
+        let events = transaction.object_store(v11::keys::EVENTS).unwrap();
+        assert!(events.index_names().any(|name| name == v11::keys::EVENTS_STATE_KEY_TIMESTAMP));
+        assert_eq!(events.count().await.unwrap(), 0);
     }
 }
