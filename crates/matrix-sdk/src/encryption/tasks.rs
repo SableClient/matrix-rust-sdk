@@ -453,11 +453,6 @@ impl BundleReceiverTask {
     async fn listen_task(client: WeakClient, stream: impl Stream<Item = RoomKeyBundleInfo>) {
         let mut stream = pin!(stream);
 
-        // TODO: Listening to this stream is not enough for iOS due to the NSE
-        // killing our OlmMachine and thus also this stream. We need to add an
-        // event handler that will listen for the bundle event. To be able to
-        // add an event handler, we'll have to implement the bundle event in
-        // Ruma.
         while let Some(bundle_info) = stream.next().await {
             let Some(client) = client.get() else {
                 // The client was dropped while we were waiting on the stream.
