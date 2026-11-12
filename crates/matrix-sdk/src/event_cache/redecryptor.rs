@@ -1114,16 +1114,21 @@ impl Redecryptor {
 
     /// (Re)-subscribe to the room key stream from the [`OlmMachine`].
     ///
-    /// This needs to happen any time this stream returns a `None` meaning that
-    /// the sending part of the stream has been dropped.
+    /// This needs to happen any time the [`OlmMachine`] is regenerated. The
+    /// returned receiver reports that: the streams of a replaced machine only
+    /// end once nothing holds that machine anymore.
     async fn subscribe_to_room_key_stream(
         cache: &Weak<EventCacheInner>,
     ) -> Option<(
         impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>,
         impl Stream<Item = Vec<RoomKeyWithheldInfo>>,
+        tokio::sync::watch::Receiver<u64>,
     )> {
         let event_cache = cache.upgrade()?;
         let client = event_cache.client().ok()?;
+        // Subscribe before reading the machine, so that a regeneration
+        // happening in between is reported instead of missed.
+        let regenerations = client.base_client().subscribe_to_olm_machine_regenerations();
         let machine = client.olm_machine().await;
 
         if machine.is_none() {
@@ -1131,7 +1136,11 @@ impl Redecryptor {
         }
 
         machine.as_ref().map(|m| {
-            (m.store().room_keys_received_stream(), m.store().room_keys_withheld_received_stream())
+            (
+                m.store().room_keys_received_stream(),
+                m.store().room_keys_withheld_received_stream(),
+                regenerations,
+            )
         })
     }
 
@@ -1328,7 +1337,7 @@ impl Redecryptor {
         // which our existing streams will return `None`. We loop and
         // re-subscribe when this happen.
         'resubscribe: loop {
-            let Some((room_key_stream, withheld_stream)) =
+            let Some((room_key_stream, withheld_stream, mut regenerations)) =
                 Self::subscribe_to_room_key_stream(&cache).await
             else {
                 // We failed to re-subscribe, meaning the OlmMachine is gone
@@ -1341,6 +1350,13 @@ impl Redecryptor {
 
             loop {
                 tokio::select! {
+                    // The OlmMachine got regenerated, the streams above belong to
+                    // the previous one and will never yield a room key again.
+                    Ok(()) = regenerations.changed() => {
+                        collator.lock().lagged = true;
+                        notify.notify_one();
+                        continue 'resubscribe
+                    }
                     room_keys = room_key_stream.next() => {
                         match room_keys {
                             Some(Ok(room_keys)) => {
@@ -1665,6 +1681,9 @@ mod tests {
 
         let (_, mut subscriber) = room_cache.subscribe().await.unwrap();
         let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
+
+        // While something holds the machine, its room key stream never ends.
+        let _previous = bob.olm_machine().await.clone();
 
         // We regenerate the Olm machine to check if the room key stream is
         // recreated to correctly.

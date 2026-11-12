@@ -125,6 +125,15 @@ pub struct BaseClient {
     #[cfg(feature = "e2e-encryption")]
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
 
+    /// Counts the times [`BaseClient::regenerate_olm`] replaced the
+    /// `OlmMachine`.
+    ///
+    /// A stream taken from a replaced machine only ends once every handle to
+    /// that machine is gone, so it cannot be relied upon to notice the
+    /// replacement.
+    #[cfg(feature = "e2e-encryption")]
+    olm_machine_generation: tokio::sync::watch::Sender<u64>,
+
     /// Observable of when a user is ignored/unignored.
     pub(crate) ignore_user_list_changes: SharedObservable<Vec<OwnedUserId>>,
 
@@ -226,6 +235,8 @@ impl BaseClient {
             crypto_store: config.crypto_store,
             #[cfg(feature = "e2e-encryption")]
             olm_machine: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            olm_machine_generation: Default::default(),
             ignore_user_list_changes: Default::default(),
             global_profile_updates_sender: broadcast::Sender::new(16),
             #[cfg(feature = "e2e-encryption")]
@@ -272,6 +283,7 @@ impl BaseClient {
             //    or Olm sessions when they encrypt or decrypt messages.
             crypto_store: self.crypto_store.clone(),
             olm_machine: self.olm_machine.clone(),
+            olm_machine_generation: self.olm_machine_generation.clone(),
             ignore_user_list_changes: Default::default(),
             global_profile_updates_sender: broadcast::Sender::new(16),
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
@@ -459,6 +471,7 @@ impl BaseClient {
         let room_keys_stream = olm_machine.store().room_keys_received_stream();
 
         *self.olm_machine.write().await = Some(olm_machine);
+        self.olm_machine_generation.send_modify(|generation| *generation += 1);
 
         // Retry pending encrypted sticky events as this machine receives room
         // keys; the task bound to the previous machine, if any, is dropped.
@@ -1147,6 +1160,17 @@ impl BaseClient {
     #[cfg(feature = "e2e-encryption")]
     pub async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
         self.olm_machine.read().await
+    }
+
+    /// Get notified when [`BaseClient::regenerate_olm`] replaces the
+    /// `OlmMachine`.
+    ///
+    /// Anything subscribed to a stream of the previous machine must
+    /// subscribe again to the new one: the old stream stays open for as long
+    /// as something else still holds that machine.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn subscribe_to_olm_machine_regenerations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.olm_machine_generation.subscribe()
     }
 
     /// Get the push rules.
