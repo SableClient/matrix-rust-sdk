@@ -1490,14 +1490,15 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn devices_stream(&self) -> Result<impl Stream<Item = DeviceUpdates> + use<>> {
-        let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
         let client = self.client.to_owned();
+        let subscribe = move |olm: &OlmMachine| {
+            let client = client.to_owned();
+            olm.store()
+                .devices_stream()
+                .map(move |updates| DeviceUpdates::new(client.to_owned(), updates))
+        };
 
-        Ok(olm
-            .store()
-            .devices_stream()
-            .map(move |updates| DeviceUpdates::new(client.to_owned(), updates)))
+        follow_olm_machine(&self.client, subscribe, || None).await.ok_or(Error::NoOlmMachine)
     }
 
     /// Returns a stream of user identity updates, allowing users to listen for
@@ -1531,14 +1532,15 @@ impl Encryption {
     pub async fn user_identities_stream(
         &self,
     ) -> Result<impl Stream<Item = IdentityUpdates> + use<>> {
-        let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
         let client = self.client.to_owned();
+        let subscribe = move |olm: &OlmMachine| {
+            let client = client.to_owned();
+            olm.store()
+                .user_identities_stream()
+                .map(move |updates| IdentityUpdates::new(client.to_owned(), updates))
+        };
 
-        Ok(olm
-            .store()
-            .user_identities_stream()
-            .map(move |updates| IdentityUpdates::new(client.to_owned(), updates)))
+        follow_olm_machine(&self.client, subscribe, || None).await.ok_or(Error::NoOlmMachine)
     }
 
     /// Create and upload a new cross signing identity.
@@ -1924,7 +1926,9 @@ impl Encryption {
     /// [`Vec`].
     ///
     /// If the reader of the stream lags too far behind, an error is broadcast
-    /// containing the number of skipped items.
+    /// containing the number of skipped items. The same error, with a count of
+    /// zero, is broadcast when the `OlmMachine` got regenerated: room keys
+    /// received around that time may not have been reported.
     ///
     /// # Examples
     ///
@@ -1951,10 +1955,12 @@ impl Encryption {
         &self,
     ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> + use<>>
     {
-        let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref()?;
-
-        Some(olm.store().room_keys_received_stream())
+        follow_olm_machine(
+            &self.client,
+            |olm: &OlmMachine| olm.store().room_keys_received_stream(),
+            || Some(Err(BroadcastStreamRecvError::Lagged(0))),
+        )
+        .await
     }
 
     /// Receive notifications of historic room key bundles as a [`Stream`].
@@ -1991,10 +1997,12 @@ impl Encryption {
     pub async fn historic_room_key_stream(
         &self,
     ) -> Option<impl Stream<Item = RoomKeyBundleInfo> + use<>> {
-        let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref()?;
-
-        Some(olm.store().historic_room_key_stream())
+        follow_olm_machine(
+            &self.client,
+            |olm: &OlmMachine| olm.store().historic_room_key_stream(),
+            || None,
+        )
+        .await
     }
 
     /// Get the secret storage manager of the client.
@@ -2461,6 +2469,84 @@ impl Encryption {
     }
 }
 
+/// Subscribe to a stream of the [`OlmMachine`], and subscribe again each time
+/// the machine is regenerated.
+///
+/// A stream of the machine holds that machine. Handing such a stream out as is
+/// would keep a replaced machine alive for as long as the stream is, and the
+/// stream would never yield again.
+///
+/// Items sent around a regeneration can be missed. `resubscribed` is called
+/// after each new subscription and may return an item telling the consumer so.
+///
+/// Returns `None` if there is no [`OlmMachine`] yet.
+async fn follow_olm_machine<S, F>(
+    client: &Client,
+    subscribe: F,
+    resubscribed: fn() -> Option<S::Item>,
+) -> Option<impl Stream<Item = S::Item> + use<S, F>>
+where
+    S: Stream,
+    F: Fn(&OlmMachine) -> S,
+{
+    enum Next<T> {
+        Item(T),
+        Regenerated,
+        Ended,
+    }
+
+    // Subscribe before reading the machine, so that a regeneration happening
+    // in between is reported instead of missed.
+    let mut regenerations = client.base_client().subscribe_to_olm_machine_regenerations();
+    let first = client.olm_machine().await.as_ref().map(&subscribe)?;
+    let client = client.downgrade();
+
+    // Pinned on the heap so that the stream stays `Unpin`, as the streams of
+    // the machine are.
+    Some(Box::pin(async_stream::stream! {
+        let mut inner = Box::pin(first);
+
+        loop {
+            let next = tokio::select! {
+                biased;
+                changed = regenerations.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    Next::Regenerated
+                }
+                item = inner.next() => item.map_or(Next::Ended, Next::Item),
+            };
+
+            match next {
+                Next::Item(item) => {
+                    yield item;
+                    continue;
+                }
+                Next::Regenerated => {}
+                // The machine is dropped right before its regeneration is
+                // reported.
+                Next::Ended => {
+                    if regenerations.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let stream = match client.get() {
+                Some(client) => client.olm_machine().await.as_ref().map(&subscribe),
+                None => None,
+            };
+            let Some(stream) = stream else { break };
+            inner = Box::pin(stream);
+
+            if let Some(item) = resubscribed() {
+                yield item;
+            }
+        }
+    }))
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
@@ -2497,6 +2583,77 @@ mod tests {
             client::mock_matrix_session, logged_in_client, no_retry_test_client, set_client_session,
         },
     };
+
+    #[async_test]
+    async fn test_streams_follow_a_regenerated_olm_machine() {
+        use std::time::Duration;
+
+        use futures_util::{FutureExt as _, StreamExt as _};
+        use tokio::time::timeout;
+
+        let client = logged_in_client(None).await;
+        let previous = client.olm_machine().await.clone().expect("We should have an OlmMachine");
+
+        let mut room_keys = client
+            .encryption()
+            .room_keys_received_stream()
+            .await
+            .expect("We should be able to get the room keys stream");
+        let mut devices = client
+            .encryption()
+            .devices_stream()
+            .await
+            .expect("We should be able to get the devices stream");
+        let mut identities = client
+            .encryption()
+            .user_identities_stream()
+            .await
+            .expect("We should be able to get the identities stream");
+
+        client
+            .base_client()
+            .regenerate_olm(None)
+            .await
+            .expect("We should be able to regenerate the Olm machine");
+
+        assert_matches::assert_matches!(
+            timeout(Duration::from_secs(1), room_keys.next()).await,
+            Ok(Some(Err(_)))
+        );
+
+        {
+            let machine = client.olm_machine().await;
+            let machine = machine.as_ref().expect("We should have an OlmMachine");
+            assert!(!machine.same_as(&previous));
+
+            machine
+                .store()
+                .import_exported_room_keys(vec![super::backups::test::room_key()], |_, _| {})
+                .await
+                .expect("We should be able to import a room key");
+        }
+
+        let keys = timeout(Duration::from_secs(1), room_keys.next())
+            .await
+            .expect("The stream should report the room key")
+            .expect("The stream should still be open")
+            .expect("The stream should not have lagged");
+        assert_eq!(keys.len(), 1);
+
+        // A stream moves to the new machine when it is polled, which a
+        // consumer waiting on it is woken up to do.
+        assert!(devices.next().now_or_never().is_none());
+        assert!(identities.next().now_or_never().is_none());
+
+        // None of the streams keeps the replaced machine alive: ours is the
+        // last handle, so dropping it ends the streams of that machine.
+        let mut stale = previous.store().room_keys_received_stream();
+        drop(previous);
+        assert_matches::assert_matches!(
+            timeout(Duration::from_secs(1), stale.next()).await,
+            Ok(None)
+        );
+    }
 
     #[async_test]
     async fn test_reaction_sending() {
