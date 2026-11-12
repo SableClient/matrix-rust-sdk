@@ -1125,7 +1125,7 @@ impl<T: Into<Error>> From<T> for EnableBackupError {
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-mod test {
+pub(crate) mod test {
     use std::{assert_matches, time::Duration};
 
     use matrix_sdk_base::crypto::{
@@ -1149,7 +1149,7 @@ mod test {
     use super::*;
     use crate::test_utils::{logged_in_client, mocks::MatrixMockServer};
 
-    fn room_key() -> ExportedRoomKey {
+    pub(crate) fn room_key() -> ExportedRoomKey {
         let json = json!({
             "algorithm": "m.megolm.v1.aes-sha2",
             "room_id": "!DovneieKSTkdHKpIXy:morpheus.localhost",
