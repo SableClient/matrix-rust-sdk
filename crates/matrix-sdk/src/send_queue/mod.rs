@@ -32,6 +32,8 @@
 //! queued after it (in the same room) from being sent, so events are never sent
 //! out of order; the queue resumes when the wedged request is retried (with
 //! [`SendHandle::unwedge`]) or removed (with [`SendHandle::abort`]).
+//! Requests rejected with `M_FORBIDDEN` remain failed but do not block later
+//! requests, since a room's policy may allow other event types or content.
 //!
 //! Event content whose canonical JSON exceeds the complete event size limit is
 //! rejected with [`RoomSendQueueStorageError::EventTooLarge`] before it is
@@ -1168,7 +1170,7 @@ impl RoomSendQueue {
                         // Mark the request as wedged, so it's not picked at any
                         // future point; it will also block subsequent requests
                         // in the same room from being sent, until it's unwedged
-                        // or removed, so as to preserve ordering.
+                        // or removed, except when rejected with M_FORBIDDEN.
                         if let Err(storage_error) =
                             queue.mark_as_wedged(&txn_id, QueueWedgeError::from(&err)).await
                         {
@@ -1482,6 +1484,12 @@ impl From<&crate::Error> for QueueWedgeError {
                 QueueWedgeError::ExpiredAccessToken
             }
 
+            crate::Error::Http(error)
+                if matches!(error.client_api_error_kind(), Some(ErrorKind::Forbidden)) =>
+            {
+                QueueWedgeError::Forbidden { msg: value.to_string() }
+            }
+
             _ => QueueWedgeError::GenericApiError { msg: value.to_string() },
         }
     }
@@ -1675,13 +1683,13 @@ impl QueueStorage {
         let queued_requests =
             guard.client()?.state_store().load_send_queue_requests(&self.room_id).await?;
 
-        // Only ever consider the head of the queue: requests must be sent in
-        // the order they were queued, so a wedged request (which failed to be
-        // sent with an unrecoverable error) blocks all the requests queued
-        // after it. Otherwise, messages would be sent out of order, until the
-        // wedged request is either manually unwedged or removed (both of which
-        // will wake up the sending task).
-        if let Some(request) = queued_requests.first().filter(|queued| !queued.is_wedged()) {
+        // Skip policy rejections while retaining their failed local echoes.
+        // Other wedged requests still block the queue to preserve ordering.
+        if let Some(request) = queued_requests
+            .iter()
+            .find(|queued| !matches!(queued.error, Some(QueueWedgeError::Forbidden { .. })))
+            .filter(|queued| !queued.is_wedged())
+        {
             let (cancel_upload_tx, cancel_upload_rx) =
                 if matches!(request.kind, QueuedRequestKind::MediaUpload { .. }) {
                     let (tx, rx) = oneshot::channel();
