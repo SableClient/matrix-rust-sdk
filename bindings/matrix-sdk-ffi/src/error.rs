@@ -346,7 +346,9 @@ impl From<SdkQueueWedgeError> for QueueWedgeError {
             SdkQueueWedgeError::InvalidMimeType { mime_type } => {
                 Self::InvalidMimeType { mime_type }
             }
-            SdkQueueWedgeError::GenericApiError { msg } => Self::GenericApiError { msg },
+            SdkQueueWedgeError::Forbidden { msg } | SdkQueueWedgeError::GenericApiError { msg } => {
+                Self::GenericApiError { msg }
+            }
         }
     }
 }

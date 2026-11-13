@@ -230,6 +230,14 @@ pub enum QueueWedgeError {
         mime_type: String,
     },
 
+    /// The homeserver refused this request with `M_FORBIDDEN`. It stays failed
+    /// until retried or aborted, but does not block subsequent requests.
+    #[error("{msg}")]
+    Forbidden {
+        /// Description of the error.
+        msg: String,
+    },
+
     /// Other errors.
     #[error("Other unrecoverable error: {msg}")]
     GenericApiError {

@@ -2230,6 +2230,79 @@ async fn test_unrecoverable_errors() {
 }
 
 #[async_test]
+async fn test_forbidden_image_does_not_block_later_messages() {
+    for status in [400, 403] {
+        let mock = MatrixMockServer::new().await;
+        let client = mock.client_builder().build().await;
+        mock.mock_room_state_encryption().plain().mount().await;
+        let room = mock.sync_joined_room(&client, room_id!("!a:b.c")).await;
+        let q = room.send_queue();
+        q.set_enabled(false);
+        let (_, mut watch) = q.subscribe().await.unwrap();
+        let mut global_watch = client.send_queue().subscribe();
+
+        let rejected = mock
+            .mock_room_send()
+            .body_matches_partial_json(json!({"msgtype": "m.image"}))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "errcode": "M_FORBIDDEN",
+                "error": "Images are not allowed in this room",
+            })))
+            .expect(1)
+            .mount_as_scoped()
+            .await;
+        mock.mock_room_send()
+            .body_matches_partial_json(json!({"msgtype": "m.text"}))
+            .ok(event_id!("$text"))
+            .expect(2)
+            .mount()
+            .await;
+
+        let handle = q
+            .send(
+                RoomMessageEventContent::new(MessageType::Image(ImageMessageEventContent::plain(
+                    "image.png".to_owned(),
+                    mxc_uri!("mxc://example.org/image").to_owned(),
+                )))
+                .into(),
+            )
+            .await
+            .unwrap();
+        q.send(RoomMessageEventContent::text_plain("already queued").into()).await.unwrap();
+        q.set_enabled(true);
+
+        let (image_txn, _) =
+            assert_update!((global_watch, watch) => local echo { body = "image.png" });
+        let (queued_txn, _) =
+            assert_update!((global_watch, watch) => local echo { body = "already queued" });
+        assert_update!((global_watch, watch) => error { recoverable=false, txn=image_txn });
+        assert_update!((global_watch, watch) => sent { txn=queued_txn, });
+
+        q.send(RoomMessageEventContent::text_plain("after rejection").into()).await.unwrap();
+        let (following_txn, _) =
+            assert_update!((global_watch, watch) => local echo { body = "after rejection" });
+        assert_update!((global_watch, watch) => sent { txn=following_txn, });
+
+        let (echoes, _) = q.subscribe().await.unwrap();
+        assert_eq!(echoes.len(), 1);
+        assert_eq!(echoes[0].transaction_id, image_txn);
+        assert_matches!(
+            echoes[0].content,
+            LocalEchoContent::Event {
+                send_error: Some(matrix_sdk::store::QueueWedgeError::Forbidden { .. }),
+                ..
+            }
+        );
+
+        drop(rejected);
+        mock.mock_room_send().ok(event_id!("$image")).mock_once().mount().await;
+        handle.unwedge().await.unwrap();
+        assert_update!((global_watch, watch) => retry { txn=image_txn });
+        assert_update!((global_watch, watch) => sent { txn=image_txn, });
+    }
+}
+
+#[async_test]
 async fn test_unwedge_unrecoverable_errors() {
     let mock = MatrixMockServer::new().await;
 
