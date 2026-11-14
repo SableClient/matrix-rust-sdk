@@ -338,6 +338,29 @@ impl Caches {
             own_thread_read_receipts,
         } = EphemeralEvents::from_sync(room.own_user_id(), original_ephemeral);
 
+        // Threads must be aggregated before the room applies redactions, while
+        // the redacted events still carry their thread root.
+        let timeline_and_read_receipts_for_threads = {
+            // To aggregate the timelines for threads, we need to lookup in
+            // the room cache and the thread caches. We acquire a read lock
+            // over all the caches, and select the room cache and thread
+            // cache' states.
+            let all_states_lock = states::CacheStateLock::new(
+                states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
+                self.internals.state.clone(),
+            );
+            let all_states = all_states_lock.read().await?;
+
+            aggregator::aggregate_timeline_and_read_receipts_for_threads(
+                &original_timeline,
+                own_thread_read_receipts,
+                all_states.threads(),
+                all_states.room(),
+                &internals.room_version_rules.redaction,
+            )
+            .await?
+        };
+
         // Room.
         {
             room.handle_joined_room_update(
@@ -359,27 +382,6 @@ impl Caches {
 
         // Threads.
         {
-            let timeline_and_read_receipts_for_threads = {
-                // To aggregate the timelines for threads, we need to lookup in
-                // the room cache and the thread caches. We acquire a read lock
-                // over all the caches, and select the room cache and thread
-                // cache' states.
-                let all_states_lock = states::CacheStateLock::new(
-                    states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
-                    self.internals.state.clone(),
-                );
-                let all_states = all_states_lock.read().await?;
-
-                aggregator::aggregate_timeline_and_read_receipts_for_threads(
-                    &original_timeline,
-                    own_thread_read_receipts,
-                    all_states.threads(),
-                    all_states.room(),
-                    &internals.room_version_rules.redaction,
-                )
-                .await?
-            };
-
             for (thread_id, (timeline, read_receipts)) in timeline_and_read_receipts_for_threads {
                 // Update the thread summary if and only if there are new
                 // events.
