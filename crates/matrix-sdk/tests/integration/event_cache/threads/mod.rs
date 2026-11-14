@@ -1,6 +1,6 @@
 mod read_receipts;
 
-use std::{ops::Not, time::Duration};
+use std::{ops::Not, sync::Arc, time::Duration};
 
 use eyeball_im::VectorDiff;
 use imbl::Vector;
@@ -9,11 +9,14 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{RoomEventCacheUpdate, Subscriber, ThreadEventCacheUpdate, TimelineVectorDiffs},
     sleep::sleep,
+    store::StoreConfig,
     test_utils::{
         assert_event_matches_msg,
         mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     },
 };
+use matrix_sdk_base::event_cache::store::MemoryStore;
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedEventId, OwnedRoomId, event_id,
@@ -1193,4 +1196,205 @@ async fn test_reaction_on_thread_root_reaches_thread_timeline() {
     assert_let!(VectorDiff::Append { values: new_events } = &diffs[0]);
     assert_eq!(new_events.len(), 1);
     assert_eq!(new_events[0].event_id(), Some(reaction_id));
+}
+
+/// Persist a thread root with `replies` threaded replies, then restart the
+/// client over the same event cache store, so that no thread cache is loaded.
+async fn restarted_client_with_thread(
+    server: &MatrixMockServer,
+    room_id: &ruma::RoomId,
+    thread_root_id: &ruma::EventId,
+    replies: &[&ruma::EventId],
+) -> Client {
+    let event_cache_store = Arc::new(MemoryStore::new());
+
+    let build_client = || async {
+        server
+            .client_builder()
+            .on_builder(|builder| {
+                builder
+                    .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: false })
+                    .store_config(
+                        StoreConfig::new(CrossProcessLockConfig::multi_process("process"))
+                            .event_cache_store(event_cache_store.clone()),
+                    )
+            })
+            .build()
+            .await
+    };
+
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    {
+        let client = build_client().await;
+
+        let mut room = JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("da r00t").event_id(thread_root_id));
+        for reply in replies {
+            room = room.add_timeline_event(
+                f.text_msg("reply").in_thread(thread_root_id, thread_root_id).event_id(*reply),
+            );
+        }
+        server.sync_room(&client, room).await;
+
+        let (room_event_cache, _drop_handles) =
+            client.event_cache().unwrap().room(room_id).await.unwrap();
+        let events = room_event_cache.events().await.unwrap();
+        assert_eq!(events.len(), 1 + replies.len());
+    }
+
+    let client = build_client().await;
+    server.sync_joined_room(&client, room_id).await;
+    client
+}
+
+#[async_test]
+async fn test_redact_only_reply_without_loaded_thread_updates_summary() {
+    // The only reply of a thread is redacted while the thread cache has never
+    // been loaded (e.g. after a restart): the thread summary on the thread root
+    // must be refreshed regardless.
+
+    let server = MatrixMockServer::new().await;
+    let room_id = room_id!("!omelette:fromage.fr");
+    let thread_root_id = event_id!("$thread_root");
+    let reply_id = event_id!("$reply");
+
+    let client = restarted_client_with_thread(&server, room_id, thread_root_id, &[reply_id]).await;
+
+    let (room_event_cache, _drop_handles) =
+        client.event_cache().unwrap().room(room_id).await.unwrap();
+    let (_, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(reply_id).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            room_stream.recv()
+    );
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateThreadSummary { thread_root, thread_summary }) =
+            room_stream.recv()
+    );
+    assert_eq!(thread_root, thread_root_id);
+    assert_eq!(thread_summary.num_replies, 0);
+    assert!(thread_summary.latest_reply.is_none());
+}
+
+#[async_test]
+async fn test_redact_latest_reply_without_loaded_thread_updates_summary() {
+    // Same as above, with two replies: the summary must fall back to the
+    // previous reply.
+
+    let server = MatrixMockServer::new().await;
+    let room_id = room_id!("!omelette:fromage.fr");
+    let thread_root_id = event_id!("$thread_root");
+    let first_reply_id = event_id!("$reply1");
+    let second_reply_id = event_id!("$reply2");
+
+    let client = restarted_client_with_thread(
+        &server,
+        room_id,
+        thread_root_id,
+        &[first_reply_id, second_reply_id],
+    )
+    .await;
+
+    let (room_event_cache, _drop_handles) =
+        client.event_cache().unwrap().room(room_id).await.unwrap();
+    let (_, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(second_reply_id).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            room_stream.recv()
+    );
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateThreadSummary { thread_root, thread_summary }) =
+            room_stream.recv()
+    );
+    assert_eq!(thread_root, thread_root_id);
+    assert_eq!(thread_summary.num_replies, 1);
+    assert_eq!(thread_summary.latest_reply.as_deref(), Some(first_reply_id));
+}
+
+#[async_test]
+async fn test_redact_latest_reply_updates_summary() {
+    // The latest of two replies is redacted first: the summary must fall back
+    // to the previous reply.
+
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let thread_root_id = event_id!("$thread_root");
+    let first_reply_id = event_id!("$reply1");
+    let second_reply_id = event_id!("$reply2");
+
+    server.sync_joined_room(&client, room_id).await;
+
+    let (room_event_cache, _drop_handles) =
+        client.event_cache().unwrap().room(room_id).await.unwrap();
+    let (_, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("da r00t").event_id(thread_root_id))
+                .add_timeline_event(
+                    f.text_msg("first")
+                        .in_thread(thread_root_id, thread_root_id)
+                        .event_id(first_reply_id),
+                )
+                .add_timeline_event(
+                    f.text_msg("second")
+                        .in_thread(thread_root_id, thread_root_id)
+                        .event_id(second_reply_id),
+                ),
+        )
+        .await;
+
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            room_stream.recv()
+    );
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateThreadSummary { thread_summary, .. }) = room_stream.recv()
+    );
+    assert_eq!(thread_summary.num_replies, 2);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(second_reply_id).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            room_stream.recv()
+    );
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateThreadSummary { thread_root, thread_summary }) =
+            room_stream.recv()
+    );
+    assert_eq!(thread_root, thread_root_id);
+    assert_eq!(thread_summary.num_replies, 1);
+    assert_eq!(thread_summary.latest_reply.as_deref(), Some(first_reply_id));
 }

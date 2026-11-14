@@ -156,27 +156,24 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
                 // Otherwise, this event might be a redaction that applies to a thread.
                 else if let Some(redaction_target) =
                     extract_redaction_target(event.raw(), redaction_rules)
-                    && match &maybe_room {
-                        Some(room) => room.find_event(&redaction_target).await?.is_some(),
-                        None => false,
-                    }
+                    && let Some(room) = &maybe_room
+                    && let Some((_location, target_event)) =
+                        room.find_event(&redaction_target).await?
                 {
-                    // The redacted event exists (in the room, because it
-                    // contains _all_ the events) **but** the event has been
-                    // redacted (in the room). It's no more possible to extract
-                    // its thread root (because this information has been
-                    // removed).
-                    //
-                    // But we need to know if the event is part of a thread to
-                    // apply the redaction in the thread too. No other choice
-                    // than doing a full search…
+                    // The room contains _all_ the events. If it still holds the
+                    // original event, its thread root can be read directly.
+                    let mut associated_thread_root = extract_thread_root(target_event.raw());
 
-                    let mut associated_thread_root = None;
-
-                    for thread in existing_threads.values() {
-                        if thread.find_event(&redaction_target).await?.is_some() {
-                            associated_thread_root = Some(thread.thread_id.clone());
-                            break;
+                    // Otherwise, the event has already been redacted (in the
+                    // room), and it's no more possible to extract its thread
+                    // root (because this information has been removed). No
+                    // other choice than doing a full search…
+                    if associated_thread_root.is_none() {
+                        for thread in existing_threads.values() {
+                            if thread.find_event(&redaction_target).await?.is_some() {
+                                associated_thread_root = Some(thread.thread_id.clone());
+                                break;
+                            }
                         }
                     }
 
