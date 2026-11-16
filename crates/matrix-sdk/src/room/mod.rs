@@ -2009,6 +2009,77 @@ impl Room {
         }
     }
 
+    /// Like [`Self::decrypt_event`], but a missing room key is never requested
+    /// from our other devices. Key backup is still consulted.
+    ///
+    /// For bulk work over old history, such as building a search index, where
+    /// a request per undecryptable event would flood every other device.
+    #[cfg(feature = "e2e-encryption")]
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
+    pub async fn decrypt_event_without_key_request(
+        &self,
+        event: &Raw<OriginalSyncRoomEncryptedEvent>,
+    ) -> Result<TimelineEvent> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        match machine
+            .try_decrypt_room_event_without_key_request(
+                event.cast_ref(),
+                self.inner.room_id(),
+                self.client.decryption_settings(),
+            )
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => {
+                Ok(TimelineEvent::from_decrypted(decrypted, None))
+            }
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                self.client
+                    .encryption()
+                    .backups()
+                    .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+                Ok(TimelineEvent::from_utd(event.clone().cast(), utd_info))
+            }
+        }
+    }
+
+    /// Like [`Self::decrypt_event`], but a missing room key is never requested
+    /// from our other devices. Key backup is still consulted.
+    ///
+    /// For bulk work over old history, such as building a search index, where
+    /// a request per undecryptable event would flood every other device.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub async fn decrypt_event_without_key_request<T: JsonCastable<EncryptedEvent>>(
+        &self,
+        event: &Raw<T>,
+    ) -> Result<TimelineEvent> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        match machine
+            .try_decrypt_room_event_without_key_request(
+                event.cast_ref(),
+                self.inner.room_id(),
+                self.client.decryption_settings(),
+            )
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => {
+                Ok(TimelineEvent::from_decrypted(decrypted, None))
+            }
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                self.client
+                    .encryption()
+                    .backups()
+                    .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+                // Cast safety: Anything that can be cast to EncryptedEvent must
+                // be a timeline event.
+                Ok(TimelineEvent::from_utd(event.clone().cast_unchecked(), utd_info))
+            }
+        }
+    }
+
     /// Fetches the [`EncryptionInfo`] for an event decrypted with the supplied
     /// session_id.
     ///

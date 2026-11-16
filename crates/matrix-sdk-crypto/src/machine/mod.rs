@@ -2444,7 +2444,34 @@ impl OlmMachine {
         room_id: &RoomId,
         decryption_settings: &DecryptionSettings,
     ) -> Result<RoomEventDecryptionResult, CryptoStoreError> {
-        match self.decrypt_room_event_inner(raw_event, room_id, true, decryption_settings).await {
+        self.try_decrypt_room_event_with(raw_event, room_id, decryption_settings, true).await
+    }
+
+    /// Like [`Self::try_decrypt_room_event`], but a missing room key is never
+    /// requested from our other devices.
+    ///
+    /// For bulk work over old history, such as building a search index, where
+    /// a request per undecryptable event would flood every other device.
+    pub async fn try_decrypt_room_event_without_key_request(
+        &self,
+        raw_event: &Raw<EncryptedEvent>,
+        room_id: &RoomId,
+        decryption_settings: &DecryptionSettings,
+    ) -> Result<RoomEventDecryptionResult, CryptoStoreError> {
+        self.try_decrypt_room_event_with(raw_event, room_id, decryption_settings, false).await
+    }
+
+    async fn try_decrypt_room_event_with(
+        &self,
+        raw_event: &Raw<EncryptedEvent>,
+        room_id: &RoomId,
+        decryption_settings: &DecryptionSettings,
+        request_keys: bool,
+    ) -> Result<RoomEventDecryptionResult, CryptoStoreError> {
+        match self
+            .decrypt_room_event_inner(raw_event, room_id, true, request_keys, decryption_settings)
+            .await
+        {
             Ok(decrypted) => Ok(RoomEventDecryptionResult::Decrypted(decrypted)),
             Err(err) => Ok(RoomEventDecryptionResult::UnableToDecrypt(megolm_error_to_utd_info(
                 raw_event, err,
@@ -2465,7 +2492,7 @@ impl OlmMachine {
         room_id: &RoomId,
         decryption_settings: &DecryptionSettings,
     ) -> MegolmResult<DecryptedRoomEvent> {
-        self.decrypt_room_event_inner(event, room_id, true, decryption_settings).await
+        self.decrypt_room_event_inner(event, room_id, true, true, decryption_settings).await
     }
 
     #[instrument(name = "decrypt_room_event", skip_all, fields(?room_id, event_id, origin_server_ts, sender, algorithm, session_id, message_index, sender_key))]
@@ -2474,6 +2501,7 @@ impl OlmMachine {
         event: &Raw<EncryptedEvent>,
         room_id: &RoomId,
         decrypt_unsigned: bool,
+        request_keys: bool,
         decryption_settings: &DecryptionSettings,
     ) -> MegolmResult<DecryptedRoomEvent> {
         let _timer = timer!(tracing::Level::TRACE, "_method");
@@ -2515,7 +2543,9 @@ impl OlmMachine {
                 // Optimisation should we request if we received a withheld
                 // code? Maybe for some code there is no point
                 MegolmError::MissingRoomKey(_)
-                | MegolmError::Decryption(DecryptionError::UnknownMessageIndex(_, _)) => {
+                | MegolmError::Decryption(DecryptionError::UnknownMessageIndex(_, _))
+                    if request_keys =>
+                {
                     self.inner
                         .key_request_machine
                         .create_outgoing_key_request(room_id, &event)
@@ -2533,7 +2563,12 @@ impl OlmMachine {
         if decrypt_unsigned {
             // Try to decrypt encrypted unsigned events.
             unsigned_encryption_info = self
-                .decrypt_unsigned_events(&mut decrypted_event, room_id, decryption_settings)
+                .decrypt_unsigned_events(
+                    &mut decrypted_event,
+                    room_id,
+                    request_keys,
+                    decryption_settings,
+                )
                 .await;
         }
 
@@ -2623,6 +2658,7 @@ impl OlmMachine {
         &self,
         main_event: &mut JsonObject,
         room_id: &RoomId,
+        request_keys: bool,
         decryption_settings: &DecryptionSettings,
     ) -> Option<BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>> {
         let unsigned = main_event.get_mut("unsigned")?.as_object_mut()?;
@@ -2634,7 +2670,7 @@ impl OlmMachine {
         let location = UnsignedEventLocation::RelationsReplace;
         let replace = location.find_mut(unsigned);
         if let Some(decryption_result) =
-            self.decrypt_unsigned_event(replace, room_id, decryption_settings).await
+            self.decrypt_unsigned_event(replace, room_id, request_keys, decryption_settings).await
         {
             unsigned_encryption_info
                 .get_or_insert_with(Default::default)
@@ -2645,8 +2681,9 @@ impl OlmMachine {
         // latest event of a thread.
         let location = UnsignedEventLocation::RelationsThreadLatestEvent;
         let thread_latest_event = location.find_mut(unsigned);
-        if let Some(decryption_result) =
-            self.decrypt_unsigned_event(thread_latest_event, room_id, decryption_settings).await
+        if let Some(decryption_result) = self
+            .decrypt_unsigned_event(thread_latest_event, room_id, request_keys, decryption_settings)
+            .await
         {
             unsigned_encryption_info
                 .get_or_insert_with(Default::default)
@@ -2667,6 +2704,7 @@ impl OlmMachine {
         &'a self,
         event: Option<&'a mut Value>,
         room_id: &'a RoomId,
+        request_keys: bool,
         decryption_settings: &'a DecryptionSettings,
     ) -> BoxFuture<'a, Option<UnsignedDecryptionResult>> {
         Box::pin(async move {
@@ -2682,7 +2720,13 @@ impl OlmMachine {
 
             let raw_event = serde_json::from_value(event.clone()).ok()?;
             match self
-                .decrypt_room_event_inner(&raw_event, room_id, false, decryption_settings)
+                .decrypt_room_event_inner(
+                    &raw_event,
+                    room_id,
+                    false,
+                    request_keys,
+                    decryption_settings,
+                )
                 .await
             {
                 Ok(decrypted_event) => {

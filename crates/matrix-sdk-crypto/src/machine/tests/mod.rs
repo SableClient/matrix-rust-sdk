@@ -1482,6 +1482,54 @@ async fn test_query_ratcheted_key() {
 }
 
 #[async_test]
+#[cfg(feature = "automatic-room-key-forwarding")]
+async fn test_decrypting_without_key_request_never_queues_a_request() {
+    let (alice, bob) =
+        get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
+    let room_id = room_id!("!test:example.org");
+
+    let bob_other_machine = OlmMachine::new(user_id(), device_id!("OTHERBOB")).await;
+    let bob_other_device = DeviceData::from_machine_test_helper(&bob_other_machine).await.unwrap();
+    bob.store().save_device_data(&[bob_other_device]).await.unwrap();
+    bob.get_device(user_id(), device_id!("OTHERBOB"), None)
+        .await
+        .unwrap()
+        .expect("should exist")
+        .set_trust_state(LocalTrust::Verified);
+
+    alice.create_outbound_group_session_with_defaults_test_helper(room_id).await.unwrap();
+    let result = alice
+        .encrypt_room_event(
+            room_id,
+            AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain("secret")),
+        )
+        .await
+        .unwrap();
+    let room_event = json_convert(&json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "content": result.content,
+    }))
+    .unwrap();
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let result = bob
+        .try_decrypt_room_event_without_key_request(&room_event, room_id, &decryption_settings)
+        .await
+        .unwrap();
+    assert_matches!(result, RoomEventDecryptionResult::UnableToDecrypt(_));
+    assert!(bob.inner.key_request_machine.outgoing_to_device_requests().await.unwrap().is_empty());
+
+    let result =
+        bob.try_decrypt_room_event(&room_event, room_id, &decryption_settings).await.unwrap();
+    assert_matches!(result, RoomEventDecryptionResult::UnableToDecrypt(_));
+    assert_eq!(bob.inner.key_request_machine.outgoing_to_device_requests().await.unwrap().len(), 1);
+}
+
+#[async_test]
 async fn test_room_key_over_megolm() {
     let (alice, bob) =
         get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
