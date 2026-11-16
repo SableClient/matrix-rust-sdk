@@ -32,72 +32,21 @@ fn cmp_impl(a: Option<Score>, b: Option<Score>) -> Ordering {
     }
 }
 
-/// Create a new sorter that will sort two [`RoomListItem`] by “recency score”,
-/// i.e. by comparing their [`RoomInfo::latest_event_value`]'s timestamp value,
-/// or their [`RoomInfo::recency_stamp`] value. The `Room` with the newest
-/// “recency score” comes first, i.e. newest < oldest.
+/// Create a new sorter that will sort two [`RoomListItem`] by their
+/// [`RoomInfo::recency_stamp`]. The `Room` with the highest stamp comes first.
+///
+/// Not the latest event's timestamp: a room only has one once it is subscribed
+/// to and decrypted, so rooms would move as they scroll into view.
 ///
 /// [`RoomInfo::recency_stamp`]: matrix_sdk_base::RoomInfo::recency_stamp
-/// [`RoomInfo::latest_event_value`]: matrix_sdk_base::RoomInfo::latest_event_value
 pub fn new_sorter() -> impl Sorter {
     |left, right| -> Ordering { cmp(extract_scores, left, right) }
 }
 
-/// The term _score_ is used here to avoid any confusion with a _timestamp_ (a
-/// `u64` from the latest event), or a _recency stamp_ (a `u64` from the recency
-/// stamp of the room). This type hides `u64` for the sake of semantics.
 type Score = u64;
 
-/// Extract the recency _scores_ from either the
-/// [`RoomInfo::latest_event_value`] or from [`RoomInfo::recency_stamp`].
-///
-/// We must be very careful to return data of the same nature: either a _score_
-/// from the [`LatestEventValue`]'s timestamp, or from the
-/// [`RoomInfo::recency_stamp`], but we **must never** mix both. The
-/// `RoomInfo::recency_stamp` is not a timestamp, while `LatestEventValue` uses
-/// a timestamp.
-///
-/// [`RoomInfo::recency_stamp`]: matrix_sdk_base::RoomInfo::recency_stamp
-/// [`RoomInfo::latest_event_value`]: matrix_sdk_base::RoomInfo::latest_event_value
 fn extract_scores(left: &RoomListItem, right: &RoomListItem) -> (Option<Score>, Option<Score>) {
-    // Warning 1.
-    //
-    // Be careful. This method is called **a lot** in the context of a sorter.
-    // Using `Room::latest_event` would be dramatic as it returns a clone of the
-    // `LatestEventValue`. It's better to use the more specific method
-    // `Room::latest_event_timestamp`, where the value is cached in
-    // `RoomListItem::cached_latest_event_timestamp`.
-
-    // Warning 2.
-    //
-    // A `RoomListItem` must have a unique score when sorting. Its `Score` must
-    // always be the same while sorting the rooms. Thus, the following rules
-    // must apply:
-    //
-    // - Nominal case: Two rooms with a latest event can be compared together
-    //   based on their latest event's timestamp,
-    // - Case #1: If a room has a latest event, but the other doesn't have one,
-    //   the first room has a score but the other doesn't have one,
-    // - Case #2: If none of the room has a latest event, we fallback to the
-    //   recency stamp for both rooms.
-    //
-    // The most important aspect is: if room returns its latest event's
-    // timestamp or its recency stamp, _once_, it must return it every time it's
-    // compared to another room, if possible, whatever the room is, otherwise it
-    // must return `None`.
-
-    // Nominal case and case #1.
-    if left.cached_latest_event_timestamp.is_some() || right.cached_latest_event_timestamp.is_some()
-    {
-        (
-            left.cached_latest_event_timestamp.map(|ts| ts.get().into()),
-            right.cached_latest_event_timestamp.map(|ts| ts.get().into()),
-        )
-    }
-    // Case #2.
-    else {
-        (left.cached_recency_stamp.map(Into::into), right.cached_recency_stamp.map(Into::into))
-    }
+    (left.cached_recency_stamp.map(Into::into), right.cached_recency_stamp.map(Into::into))
 }
 
 #[cfg(test)]
@@ -181,7 +130,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_extract_scores_with_none() {
+    async fn test_extract_scores_ignores_the_latest_event() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         let [mut room_a, mut room_b] =
@@ -190,62 +139,16 @@ mod tests {
         set_recency_stamp(&mut room_a, 1.into()).await;
         set_recency_stamp(&mut room_b, 2.into()).await;
 
-        // Both rooms have a `LatestEventValue::None`.
-        //
-        // Because there is no latest event, the recency stamp MUST BE USED.
+        for latest_event_value_a in
+            [none(), remote(30), local_is_sending(30), local_cannot_be_sent(30)]
         {
-            set_latest_event_value(&mut room_a, none()).await;
-            set_latest_event_value(&mut room_b, none()).await;
+            for latest_event_value_b in
+                [none(), remote(40), local_is_sending(40), local_cannot_be_sent(40)]
+            {
+                set_latest_event_value(&mut room_a, latest_event_value_a.clone()).await;
+                set_latest_event_value(&mut room_b, latest_event_value_b).await;
 
-            assert_eq!(extract_scores(&room_a, &room_b), (Some(1), Some(2)));
-        }
-
-        // `room_a` has `None`, `room_b` has something else.
-        //
-        // One of the room has a latest event, so the recency stamp MUST BE
-        // IGNORED.
-        {
-            set_latest_event_value(&mut room_a, none()).await;
-            set_latest_event_value(&mut room_b, remote(3)).await;
-
-            assert_eq!(extract_scores(&room_a, &room_b), (None, Some(3)));
-        }
-
-        // `room_b` has `None`, `room_a` has something else.
-        //
-        // One of the room has a latest event, so the recency stamp MUST BE
-        // IGNORED.
-        {
-            set_latest_event_value(&mut room_a, remote(3)).await;
-            set_latest_event_value(&mut room_b, none()).await;
-
-            assert_eq!(extract_scores(&room_a, &room_b), (Some(3), None));
-        }
-    }
-
-    #[async_test]
-    async fn test_extract_scores_with_remote_or_local() {
-        let server = MatrixMockServer::new().await;
-        let client = server.client_builder().build().await;
-        let [mut room_a, mut room_b] =
-            new_rooms([room_id!("!a:b.c"), room_id!("!d:e.f")], &client, &server).await;
-
-        set_recency_stamp(&mut room_a, 1.into()).await;
-        set_recency_stamp(&mut room_b, 2.into()).await;
-
-        // `room_a` and `room_b` has either `Remote` or `Local*`.
-        //
-        // Both rooms have a latest event, so the recency stamp MUST BE IGNORED.
-        {
-            for latest_event_value_a in [remote(3), local_is_sending(3), local_cannot_be_sent(3)] {
-                for latest_event_value_b in
-                    [remote(4), local_is_sending(4), local_cannot_be_sent(4)]
-                {
-                    set_latest_event_value(&mut room_a, latest_event_value_a.clone()).await;
-                    set_latest_event_value(&mut room_b, latest_event_value_b).await;
-
-                    assert_eq!(extract_scores(&room_a, &room_b), (Some(3), Some(4)));
-                }
+                assert_eq!(extract_scores(&room_a, &room_b), (Some(1), Some(2)));
             }
         }
     }
