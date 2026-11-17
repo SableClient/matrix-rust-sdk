@@ -914,6 +914,21 @@ impl Client {
     }
 
     #[instrument(skip_all)]
+    pub(crate) async fn send_outgoing_verification_requests(&self) {
+        let Some(requests) =
+            self.olm_machine().await.as_ref().map(OlmMachine::outgoing_verification_requests)
+        else {
+            return;
+        };
+
+        for request in requests {
+            if let Err(error) = self.send_outgoing_request(request).await {
+                warn!(?error, "Error when sending out a verification request");
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
     pub(crate) async fn send_outgoing_requests(&self) -> Result<()> {
         const MAX_CONCURRENT_REQUESTS: usize = 20;
 

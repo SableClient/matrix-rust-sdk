@@ -7,11 +7,14 @@ use matrix_sdk::{
     test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
 };
 use matrix_sdk_test::async_test;
-use ruma::{owned_device_id, owned_user_id, user_id};
+use ruma::{
+    MilliSecondsSinceUnixEpoch, api::client::sync::sync_events::msc4186,
+    events::AnyMessageLikeEvent, owned_device_id, owned_user_id, room_id, user_id,
+};
 use serde_json::json;
 use wiremock::{
     Mock, ResponseTemplate,
-    matchers::{body_json, method, path},
+    matchers::{body_json, method, path, path_regex},
 };
 
 async fn bootstrap_cross_signing(client: &Client) {
@@ -343,4 +346,82 @@ async fn test_request_user_identity() {
 
     assert_matches!(encryption.request_user_identity(bob_id).await, Ok(Some(_)));
     assert_matches!(encryption.get_user_identity(bob_id).await, Ok(Some(_)));
+}
+
+#[async_test]
+async fn test_room_list_sliding_sync_sends_queued_verification_replies() {
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+
+    let alice_user_id = owned_user_id!("@alice:example.org");
+    let alice_device_id = owned_device_id!("4L1C3");
+    let alice =
+        server.client_builder_for_crypto_end_to_end(&alice_user_id, &alice_device_id).build().await;
+
+    let bob_user_id = owned_user_id!("@bob:example.org");
+    let bob_device_id = owned_device_id!("B0B0B0B0B");
+    let bob =
+        server.client_builder_for_crypto_end_to_end(&bob_user_id, &bob_device_id).build().await;
+
+    bootstrap_cross_signing(&alice).await;
+    bootstrap_cross_signing(&bob).await;
+    server.mock_sync().ok_and_run(&alice, |_builder| {}).await;
+    server.mock_sync().ok_and_run(&bob, |_builder| {}).await;
+
+    {
+        let bob_olm = bob.olm_machine_for_testing().await;
+        bob_olm.as_ref().unwrap().update_tracked_users([alice_user_id.as_ref()]).await.unwrap();
+    }
+    server.mock_sync().ok_and_run(&bob, |_builder| {}).await;
+
+    let room_id = room_id!("!dm:example.org");
+    server.sync_joined_room(&bob, room_id).await;
+
+    let request = |event_id: &str| {
+        serde_json::from_value::<AnyMessageLikeEvent>(json!({
+            "type": "m.room.message",
+            "event_id": event_id,
+            "room_id": room_id,
+            "sender": alice_user_id,
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "content": {
+                "msgtype": "m.key.verification.request",
+                "body": "Alice is requesting to verify your key",
+                "from_device": alice_device_id,
+                "methods": ["m.sas.v1"],
+                "to": bob_user_id,
+            },
+        }))
+        .unwrap()
+    };
+    {
+        let bob_olm = bob.olm_machine_for_testing().await;
+        let bob_olm = bob_olm.as_ref().unwrap();
+        bob_olm.receive_verification_event(&request("$first")).await.unwrap();
+        bob_olm.receive_verification_event(&request("$second")).await.unwrap();
+        assert_eq!(bob_olm.outgoing_verification_requests().len(), 2);
+    }
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/rooms/.*/state/m\.room\.encryption"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({ "errcode": "M_NOT_FOUND", "error": "Event not found." })),
+        )
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/rooms/.*/send/m\.key\.verification\.cancel/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$cancel" })))
+        .expect(2)
+        .mount(server.server())
+        .await;
+
+    server
+        .mock_sliding_sync()
+        .ok_and_run(&bob, |builder| builder, msc4186::Response::new("pos".to_owned()))
+        .await;
+
+    let bob_olm = bob.olm_machine_for_testing().await;
+    assert!(bob_olm.as_ref().unwrap().outgoing_verification_requests().is_empty());
 }

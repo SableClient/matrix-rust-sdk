@@ -685,6 +685,11 @@ impl OlmMachine {
         Ok(requests)
     }
 
+    /// The verification subset of [`OlmMachine::outgoing_requests`].
+    pub fn outgoing_verification_requests(&self) -> Vec<OutgoingRequest> {
+        self.inner.verification_machine.outgoing_messages()
+    }
+
     /// Generate an "out-of-band" key query request for the given set of users.
     ///
     /// This can be useful if we need the results from [`get_identity`] or
