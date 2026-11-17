@@ -709,6 +709,13 @@ impl SlidingSync {
             // can be generated and then handled later.
             drop(position_guard);
 
+            // In-room verification replies would otherwise wait for the e2ee
+            // connection's next long-poll.
+            #[cfg(feature = "e2e-encryption")]
+            if !this.is_e2ee_enabled() {
+                this.inner.client.send_outgoing_verification_requests().await;
+            }
+
             debug!("Done handling response");
 
             Ok(updates)
