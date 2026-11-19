@@ -256,7 +256,12 @@ pub async fn get_push_room_context(
     );
 
     #[cfg(feature = "unstable-msc4563")]
-    let ctx = assign!(ctx, { is_direct: !room_info.base_info.dm_targets.is_empty() });
+    let ctx = assign!(ctx, {
+        is_direct: match &context.direct_rooms {
+            Some(direct_rooms) => direct_rooms.contains(room_id),
+            None => !room_info.base_info.dm_targets.is_empty(),
+        }
+    });
 
     Ok(Some(ctx))
 }
