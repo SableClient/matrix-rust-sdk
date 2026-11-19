@@ -183,18 +183,15 @@ async fn test_notifications_direct_message_rule() {
     let push_context = room.push_context().await.unwrap().unwrap();
     assert!(push_context.for_event(&first).await.is_empty());
 
-    // The room becomes direct.
+    // The room becomes direct, a message in the same response notifies.
+    let second = f.text_msg("How are you?").event_id(event_id!("$bbb")).into_raw_sync();
     server
         .mock_sync()
         .ok_and_run(&client, |builder| {
             builder.add_global_account_data(f.direct().add_user(bob, room_id));
+            builder
+                .add_joined_room(JoinedRoomBuilder::default().add_timeline_event(second.clone()));
         })
-        .await;
-
-    // A message notifies now.
-    let second = f.text_msg("How are you?").event_id(event_id!("$bbb")).into_raw_sync();
-    server
-        .sync_room(&client, JoinedRoomBuilder::default().add_timeline_event(second.clone()))
         .await;
 
     let (notif_room_id, notification) = assert_ready!(receiver_stream);
