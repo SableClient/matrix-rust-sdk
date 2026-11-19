@@ -1726,6 +1726,83 @@ mod timed_tests {
     }
 
     #[async_test]
+    async fn test_back_pagination_does_not_reach_the_start_after_loading_a_previous_chunk_fails() {
+        let room_id = room_id!("!galette:saucisse.bzh");
+
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+        let ev1 = f.text_msg("hello world").event_id(event_id!("$1")).into_event();
+        let ev2 = f.text_msg("howdy").event_id(event_id!("$2")).into_event();
+
+        let event_cache_store = ControlledMemoryStore::new();
+        event_cache_store
+            .handle_linked_chunk_updates(
+                LinkedChunkId::Room(room_id),
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(0),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(0), 0),
+                        items: vec![ev1],
+                    },
+                    Update::NewItemsChunk {
+                        previous: Some(ChunkIdentifier::new(0)),
+                        new: ChunkIdentifier::new(1),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(1), 0),
+                        items: vec![ev2],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let client = MockClientBuilder::new(None)
+            .on_builder({
+                let event_cache_store = event_cache_store.clone();
+
+                move |builder| {
+                    builder.store_config(
+                        StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                            .event_cache_store(event_cache_store),
+                    )
+                }
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache().unwrap();
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
+
+        let (events, mut stream) = room_event_cache.subscribe().await.unwrap();
+        assert_eq!(events.len(), 1);
+
+        event_cache_store.fail_next_previous_chunk_load();
+        room_event_cache.pagination().run_backwards_once(20).await.unwrap_err();
+        event_cache_store.stop_failing_next_previous_chunk_load();
+
+        // The storage has been cleared, so the event left in memory goes too.
+        assert_let_timeout!(
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                stream.recv()
+        );
+        assert_matches!(&diffs[0], VectorDiff::Clear);
+        assert!(room_event_cache.events().await.unwrap().is_empty());
+
+        // The next back-pagination goes to the network instead of stopping at
+        // the event that was left in memory.
+        let outcome = room_event_cache.pagination().load_more_events_backwards().await.unwrap();
+        assert_matches!(outcome, LoadMoreEventsBackwardsOutcome::Gap { prev_token: None, .. });
+    }
+
+    #[async_test]
     async fn test_room_ordering() {
         let room_id = room_id!("!galette:saucisse.bzh");
 

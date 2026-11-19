@@ -45,15 +45,17 @@ use super::{
 /// cache persists its data: for instance to check what the rest of the SDK
 /// does while the store is slow, or when it returns an error.
 ///
-/// Only [`EventCacheStore::handle_linked_chunk_updates`] and
-/// [`EventCacheStore::load_last_chunk`] are affected. All the other methods are
-/// forwarded to the inner [`MemoryStore`] as is.
+/// Only [`EventCacheStore::handle_linked_chunk_updates`],
+/// [`EventCacheStore::load_last_chunk`] and
+/// [`EventCacheStore::load_previous_chunk`] are affected. All the other methods
+/// are forwarded to the inner [`MemoryStore`] as is.
 #[derive(Debug, Clone, Default)]
 pub struct ControlledMemoryStore {
     inner: MemoryStore,
     writes_blocked: Arc<AtomicBool>,
     writes_failing: Arc<AtomicBool>,
     fail_last_chunk_load: Arc<AtomicBool>,
+    fail_previous_chunk_load: Arc<AtomicBool>,
     write_started: Arc<Notify>,
     write_finished: Arc<Notify>,
 }
@@ -98,6 +100,16 @@ impl ControlledMemoryStore {
     /// Stop making calls to [`EventCacheStore::load_last_chunk`] fail.
     pub fn stop_failing_next_last_chunk_load(&self) {
         self.fail_last_chunk_load.store(false, Ordering::SeqCst);
+    }
+
+    /// Make calls to [`EventCacheStore::load_previous_chunk`] fail.
+    pub fn fail_next_previous_chunk_load(&self) {
+        self.fail_previous_chunk_load.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop making calls to [`EventCacheStore::load_previous_chunk`] fail.
+    pub fn stop_failing_next_previous_chunk_load(&self) {
+        self.fail_previous_chunk_load.store(false, Ordering::SeqCst);
     }
 
     /// Wait until a linked chunk write starts.
@@ -194,6 +206,12 @@ impl EventCacheStore for ControlledMemoryStore {
         linked_chunk_id: LinkedChunkId<'_>,
         before_chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
+        if self.fail_previous_chunk_load.load(Ordering::SeqCst) {
+            return Err(EventCacheStoreError::backend(std::io::Error::other(
+                "`load_previous_chunk` failure requested by the test",
+            )));
+        }
+
         self.inner.load_previous_chunk(linked_chunk_id, before_chunk_identifier).await
     }
 

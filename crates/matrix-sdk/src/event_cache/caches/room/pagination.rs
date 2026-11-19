@@ -28,10 +28,10 @@ use eyeball::{SharedObservable, Subscriber};
 use futures_core::{Stream, ready};
 use matrix_sdk_base::{
     event_cache::{Event, Gap},
-    linked_chunk::{ChunkContent, LinkedChunkId, Update},
+    linked_chunk::{ChunkContent, LinkedChunkId},
 };
 use pin_project_lite::pin_project;
-use ruma::api::Direction;
+use ruma::{RoomId, api::Direction};
 use tracing::{error, trace};
 
 pub use super::super::pagination::PaginationStatus;
@@ -40,6 +40,7 @@ use super::{
         super::{
             EventCacheError, EventsOrigin, Result, RoomEventCacheGenericUpdate,
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
+            states::{ReloadPreprocessing, StateLockWriteGuard},
         },
         TimelineVectorDiffs,
         pagination::{
@@ -48,6 +49,7 @@ use super::{
         read_receipts::{contains_a_receipt_target, unresolved_receipt_targets},
     },
     RoomEventCacheInner, RoomEventCacheUpdate,
+    state::RoomEventCacheState,
 };
 use crate::{event_cache::caches::pagination::SharedPaginationStatus, room::MessagesOptions};
 
@@ -210,13 +212,8 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
             Err(err) => {
                 error!("error when loading the previous chunk of a linked chunk: {err}");
 
-                // Clear storage for this room.
-                state
-                    .store
-                    .handle_linked_chunk_updates(linked_chunk_id, vec![Update::Clear])
-                    .await?;
+                forget_all_events(&mut state, &self.room_id).await?;
 
-                // Return the error.
                 return Err(err.into());
             }
         };
@@ -233,16 +230,8 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         if let Err(err) = state.room_linked_chunk_mut().insert_new_chunk_as_first(new_first_chunk) {
             error!("error when inserting the previous chunk into its linked chunk: {err}");
 
-            // Clear storage for this room.
-            state
-                .store
-                .handle_linked_chunk_updates(
-                    LinkedChunkId::Room(&state.state.room_id),
-                    vec![Update::Clear],
-                )
-                .await?;
+            forget_all_events(&mut state, &self.room_id).await?;
 
-            // Return the error.
             return Err(err.into());
         }
 
@@ -455,4 +444,28 @@ impl fmt::Debug for RoomPagination {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("RoomPagination").finish_non_exhaustive()
     }
+}
+
+/// Forget the events in memory along with the storage for this room.
+///
+/// Clearing only the storage would leave the events in memory without the
+/// chunks before them, and the next back-pagination would take the first
+/// event in memory for the start of the room.
+async fn forget_all_events(
+    state: &mut StateLockWriteGuard<'_, RoomEventCacheState>,
+    room_id: &RoomId,
+) -> Result<()> {
+    let diffs = state.reload(ReloadPreprocessing::ForgetAll).await?;
+
+    if !diffs.is_empty() {
+        state.update_sender.send(
+            RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                diffs,
+                origin: EventsOrigin::Cache,
+            }),
+            Some(RoomEventCacheGenericUpdate { room_id: room_id.to_owned() }),
+        );
+    }
+
+    Ok(())
 }
