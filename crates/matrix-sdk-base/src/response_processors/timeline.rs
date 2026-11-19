@@ -245,7 +245,7 @@ pub async fn get_push_room_context(
         room.power_levels().await.ok()
     };
 
-    Ok(Some(assign!(
+    let ctx = assign!(
         PushConditionRoomCtx::new(
             room_id.to_owned(),
             UInt::new(member_count).unwrap_or(UInt::MAX),
@@ -253,5 +253,10 @@ pub async fn get_push_room_context(
             user_display_name
         ),
         { power_levels: power_levels.map(Into::into) }
-    )))
+    );
+
+    #[cfg(feature = "unstable-msc4563")]
+    let ctx = assign!(ctx, { is_direct: !room_info.base_info.dm_targets.is_empty() });
+
+    Ok(Some(ctx))
 }
