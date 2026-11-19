@@ -2105,7 +2105,7 @@ impl Client {
             }
         };
 
-        Some(PreJoinRoomInfo { inviter })
+        Some(PreJoinRoomInfo { room_id: room_id.to_owned(), inviter })
     }
 
     /// Finish joining a room.
@@ -2136,16 +2136,17 @@ impl Client {
             false
         };
 
-        let base_room = self
-            .base_client()
-            .room_joined(
-                room_id,
-                pre_join_room_info
-                    .as_ref()
-                    .and_then(|info| info.inviter.as_ref())
-                    .map(|i| i.user_id().to_owned()),
-            )
-            .await?;
+        // The join response may name another room than the one the inviter
+        // was read from, for instance after an alias was pointed elsewhere.
+        let inviter = pre_join_room_info
+            .filter(|info| info.room_id == room_id)
+            .and_then(|info| info.inviter)
+            .map(|inviter| inviter.user_id().to_owned());
+
+        let base_room = match inviter.clone() {
+            Some(inviter) => self.base_client().room_joined_after_invite(room_id, inviter).await?,
+            None => self.base_client().room_joined(room_id, None).await?,
+        };
         let room = Room::new(self.clone(), base_room);
 
         if mark_as_dm {
@@ -2160,16 +2161,14 @@ impl Client {
         // on avoiding a race.
         #[cfg(feature = "e2e-encryption")]
         if self.inner.enable_share_history_on_invite
-            && let Some(inviter) =
-                pre_join_room_info.as_ref().and_then(|info| info.inviter.as_ref())
+            && let Some(inviter) = &inviter
         {
-            crate::room::shared_room_history::maybe_accept_key_bundle(&room, inviter.user_id())
-                .await?;
+            crate::room::shared_room_history::maybe_accept_key_bundle(&room, inviter).await?;
         }
 
-        // Suppress "unused variable" and "unused field" lints
+        // Suppress the "unused variable" lint
         #[cfg(not(feature = "e2e-encryption"))]
-        let _ = pre_join_room_info.map(|i| i.inviter);
+        let _ = inviter;
 
         Ok(room)
     }
@@ -4710,8 +4709,10 @@ impl WeakClient {
 }
 
 /// Information about the state of a room before we joined it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PreJoinRoomInfo {
+    /// The room this was read from.
+    pub room_id: OwnedRoomId,
     /// The user who invited us to the room, if any.
     pub inviter: Option<RoomMember>,
 }
