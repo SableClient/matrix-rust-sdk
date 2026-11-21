@@ -69,7 +69,7 @@ use super::{
     TimelineItem, TimelineItemContent, TimelineItemKind, TimelineReadReceiptTracking,
     VirtualTimelineItem,
     algorithms::{rfind_event_by_id, rfind_event_item},
-    event_item::RemoteEventOrigin,
+    event_item::{RemoteEventOrigin, extract_bundled_edit_event_json},
     item::TimelineUniqueId,
     subscriber::TimelineSubscriber,
     traits::RoomDataProvider,
@@ -2140,6 +2140,32 @@ pub(super) fn edit_targets<'a>(
         .collect()
 }
 
+/// The edits of a replied-to event that is outside the timeline, oldest first:
+/// those the event cache holds, or else the one the server bundled.
+async fn replied_to_edits(
+    room: &Room,
+    event_id: &EventId,
+    event: &TimelineEvent,
+) -> Vec<TimelineEvent> {
+    let stored = async {
+        let (event_cache, _drop_handles) =
+            room.client().event_cache()?.room(room.room_id()).await.ok()?;
+        let (_, edits) = event_cache
+            .find_event_with_relations(event_id, Some(vec![RelationType::Replacement]))
+            .await
+            .ok()??;
+        Some(edits)
+    };
+    let edits = stored.await.unwrap_or_default();
+    if !edits.is_empty() {
+        return edits;
+    }
+    extract_bundled_edit_event_json(event.raw())
+        .map(TimelineEvent::from_plaintext)
+        .into_iter()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_replied_to_event<P: RoomDataProvider>(
     mut state_guard: RwLockWriteGuard<'_, TimelineState<P>>,
@@ -2175,12 +2201,25 @@ async fn fetch_replied_to_event<P: RoomDataProvider>(
     trace!("Fetching replied-to event");
     let res = match room.load_or_fetch_event(in_reply_to, None).await {
         Ok(timeline_event) => {
+            let edits = replied_to_edits(room, in_reply_to, &timeline_event).await;
             let state = state_lock.read().await;
 
             let replied_to_item =
                 EmbeddedEvent::try_from_timeline_event(timeline_event, room, &state.meta).await?;
 
-            if let Some(item) = replied_to_item {
+            if let Some(mut item) = replied_to_item {
+                if !item.content.is_redacted() {
+                    for edit in edits.into_iter().rev() {
+                        if let Ok(Some(edited)) =
+                            EmbeddedEvent::try_from_timeline_event(edit, room, &state.meta).await
+                            && edited.sender == item.sender
+                            && !edited.content.is_unable_to_decrypt()
+                        {
+                            item.content = edited.content;
+                            break;
+                        }
+                    }
+                }
                 TimelineDetails::Ready(Box::new(item))
             } else {
                 // The replied-to item is an aggregation, not a standalone item.
