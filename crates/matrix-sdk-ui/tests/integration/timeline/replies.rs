@@ -589,6 +589,131 @@ async fn test_fetch_details_sticker() {
     }
 }
 
+/// The body shown for the event that `reply` replies to.
+async fn replied_to_body(timeline: &matrix_sdk_ui::Timeline, reply: &ruma::EventId) -> String {
+    let item = timeline.item_by_event_id(reply).await.unwrap();
+    assert_let!(
+        TimelineItemContent::MsgLike(MsgLikeContent { in_reply_to: Some(in_reply_to), .. }) =
+            item.content()
+    );
+    assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
+    replied_to.content.as_message().unwrap().body().to_owned()
+}
+
+#[async_test]
+async fn test_fetch_details_applies_bundled_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let f = EventFactory::new();
+    let replied_to_event_id = event_id!("$original");
+    let response_event_id = event_id!("$response");
+    server
+        .mock_room_event()
+        .match_event_id()
+        .ok(f
+            .text_msg("original")
+            .sender(User::Alice)
+            .room(room_id)
+            .event_id(replied_to_event_id)
+            .with_bundled_edit(
+                f.text_msg("* edited")
+                    .edit(
+                        replied_to_event_id,
+                        RoomMessageEventContentWithoutRelation::text_plain("edited"),
+                    )
+                    .sender(User::Alice)
+                    .event_id(event_id!("$edit")),
+            )
+            .into())
+        .mock_once()
+        .mount()
+        .await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("reply")
+                    .reply_to(replied_to_event_id)
+                    .sender(User::Bob)
+                    .event_id(response_event_id),
+            ),
+        )
+        .await;
+    yield_now().await;
+
+    timeline.fetch_details_for_event(response_event_id).await.unwrap();
+
+    assert_eq!(replied_to_body(&timeline, response_event_id).await, "edited");
+}
+
+#[async_test]
+async fn test_fetch_details_applies_stored_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let f = EventFactory::new();
+    let replied_to_event_id = event_id!("$original");
+    let response_event_id = event_id!("$response");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("original").sender(User::Alice).event_id(replied_to_event_id),
+                )
+                .add_timeline_event(
+                    f.text_msg("* edited")
+                        .edit(
+                            replied_to_event_id,
+                            RoomMessageEventContentWithoutRelation::text_plain("edited"),
+                        )
+                        .sender(User::Alice)
+                        .event_id(event_id!("$edit")),
+                ),
+        )
+        .await;
+
+    // A gappy sync drops the edited event from the timeline, not from the
+    // event cache.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("prev-batch")
+                .add_timeline_event(
+                    f.text_msg("reply")
+                        .reply_to(replied_to_event_id)
+                        .sender(User::Bob)
+                        .event_id(response_event_id),
+                ),
+        )
+        .await;
+    yield_now().await;
+
+    assert!(timeline.item_by_event_id(replied_to_event_id).await.is_none());
+
+    timeline.fetch_details_for_event(response_event_id).await.unwrap();
+
+    assert_eq!(replied_to_body(&timeline, response_event_id).await, "edited");
+}
+
 #[async_test]
 async fn test_transfer_in_reply_to_details_to_re_received_item() {
     let server = MatrixMockServer::new().await;
