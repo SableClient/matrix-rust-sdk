@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::empty;
+use std::{collections::BTreeMap, iter::empty};
 
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
@@ -30,7 +30,8 @@ use matrix_sdk_common::executor::spawn;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId,
     events::{
-        receipt::ReceiptEventContent, relation::RelationType,
+        receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
+        relation::RelationType,
         room::redaction::SyncRoomRedactionEvent,
     },
     room_version_rules::RoomVersionRules,
@@ -766,6 +767,40 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         }
 
         Ok(())
+    }
+
+    /// Recompute the unread counts from the current user's read receipts in
+    /// the state store.
+    ///
+    /// A receipt can be in the state store without having been matched
+    /// against this room's events, which leaves the counts stale until
+    /// another receipt comes from sync.
+    pub async fn refresh_read_receipts(&mut self) -> Result<(), EventCacheError> {
+        let Some(room) = self.state.weak_room.get() else {
+            debug!("can't refresh read receipts: client's closing");
+            return Ok(());
+        };
+
+        let own_user_id = self.state.own_user_id.clone();
+        let mut stored = ReceiptEventContent(BTreeMap::new());
+
+        for receipt_type in [ReceiptType::ReadPrivate, ReceiptType::Read] {
+            for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+                if let Ok(Some((event_id, receipt))) =
+                    room.load_user_receipt(receipt_type.clone(), &thread, &own_user_id).await
+                {
+                    stored
+                        .0
+                        .entry(event_id)
+                        .or_default()
+                        .entry(receipt_type.clone())
+                        .or_default()
+                        .insert(own_user_id.clone(), receipt);
+                }
+            }
+        }
+
+        self.update_read_receipts(Some(&stored)).await
     }
 
     /// Replaces a single event, be it saved in memory or in the store.

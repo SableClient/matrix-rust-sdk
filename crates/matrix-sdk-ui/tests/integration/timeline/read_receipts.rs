@@ -18,7 +18,7 @@ use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    ThreadingSupport, assert_let_timeout,
+    StateChanges, ThreadingSupport, assert_let_timeout,
     room::Receipts,
     test_utils::mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
 };
@@ -598,6 +598,74 @@ async fn test_read_receipts_updates_on_message_like_events() {
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
     assert_eq!(own_receipt_timeline_event, event_c_id);
     assert_pending!(timeline_stream);
+}
+
+/// A receipt that isn't sent because the homeserver already has it must still
+/// bring the unread counts in line with it.
+#[async_test]
+async fn test_unsent_receipt_refreshes_unread_counts() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Live { hide_threaded_events: false })
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let f = EventFactory::new().room(room_id).sender(User::Bob);
+    let own_user_id = client.user_id().unwrap();
+    let first_event_id = event_id!("$first");
+    let second_event_id = event_id!("$second");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("first").event_id(first_event_id))
+                .add_timeline_event(f.text_msg("second").event_id(second_event_id))
+                .add_receipt(
+                    f.read_receipts()
+                        .add(
+                            first_event_id,
+                            own_user_id,
+                            EventReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+    assert_eq!(room.num_unread_messages(), 1);
+
+    // The homeserver's receipt reaches the state store without going through
+    // the event cache.
+    let mut changes = StateChanges::default();
+    changes.add_receipts(
+        room_id,
+        f.read_receipts()
+            .add(second_event_id, own_user_id, EventReceiptType::Read, ReceiptThread::Main)
+            .into_content(),
+    );
+    client.state_store().save_changes(&changes).await.unwrap();
+
+    // No receipt endpoint is mocked: sending one would fail.
+    let sent = timeline
+        .send_single_receipt(CreateReceiptType::Read, second_event_id.to_owned())
+        .await
+        .unwrap();
+
+    assert!(sent.not());
+    assert_eq!(room.num_unread_messages(), 0);
 }
 
 #[async_test]
