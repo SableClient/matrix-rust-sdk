@@ -331,6 +331,12 @@ impl RoomEventCache {
         self.inner.insert_sent_event_from_send_queue(event).await
     }
 
+    /// Recompute the unread counts of this room from the current user's read
+    /// receipts in the state store.
+    pub async fn refresh_unread_counts(&self) -> Result<()> {
+        self.inner.state.write().await?.refresh_read_receipts().await
+    }
+
     /// Return a nice debug string (a vector of lines) for the linked chunk of
     /// events for this room.
     pub async fn debug_string(&self) -> Vec<String> {

@@ -977,6 +977,17 @@ impl Timeline {
                     self.room().set_unread_flag(false).await?;
                 }
 
+                // No receipt is sent, so none will come back from sync to
+                // make the unread counts follow the one the homeserver has.
+                if matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate)
+                    && matches!(thread, ReceiptThread::Unthreaded | ReceiptThread::Main)
+                    && let Some(event_cache) = self.room().client().event_cache()
+                {
+                    let (room_event_cache, _drop_handles) =
+                        event_cache.room(self.room().room_id()).await?;
+                    room_event_cache.refresh_unread_counts().await?;
+                }
+
                 return Ok(false);
             }
         };

@@ -27,7 +27,7 @@
 use std::{sync::Arc, time::Duration};
 
 use matrix_sdk::{
-    MemoryStore as MemoryStateStore, ThreadingSupport, assert_let_timeout,
+    MemoryStore as MemoryStateStore, StateChanges, ThreadingSupport, assert_let_timeout,
     cross_process_lock::CrossProcessLockConfig,
     event_cache::RoomEventCacheUpdate,
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
@@ -1050,4 +1050,63 @@ async fn test_compute_unread_counts_after_backfill_from_disk() {
     assert_let_timeout!(Duration::from_secs(2), Ok(_) = room_cache_updates.recv());
 
     assert_eq!(room.num_unread_messages(), 3);
+}
+
+/// Test that refreshing the unread counts selects a read receipt that is in
+/// the state store but was never matched against the room's events.
+#[async_test]
+async fn test_refresh_unread_counts_uses_stored_receipts() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!omelette:fromage.fr");
+    let f = EventFactory::new().room(room_id).sender(User::Bob);
+    let own_user_id = client.user_id().unwrap();
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) =
+        client.event_cache().unwrap().room(room_id).await.unwrap();
+    let (_, mut room_cache_updates) = room_event_cache.subscribe().await.unwrap();
+    assert!(room_cache_updates.is_empty());
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("ev1").event_id(event_id!("$1")))
+                .add_timeline_event(f.text_msg("ev2").event_id(event_id!("$2")))
+                .add_timeline_event(f.text_msg("ev3").event_id(event_id!("$3")))
+                .add_receipt(
+                    f.read_receipts()
+                        .add(
+                            event_id!("$1"),
+                            own_user_id,
+                            ReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+
+    assert_let_timeout!(Ok(_) = room_cache_updates.recv());
+
+    assert_eq!(room.num_unread_messages(), 2);
+
+    // A more recent receipt reaches the state store without going through the
+    // event cache.
+    let mut changes = StateChanges::default();
+    changes.add_receipts(
+        room_id,
+        f.read_receipts()
+            .add(event_id!("$3"), own_user_id, ReceiptType::Read, ReceiptThread::Main)
+            .into_content(),
+    );
+    client.state_store().save_changes(&changes).await.unwrap();
+
+    assert_eq!(room.num_unread_messages(), 2);
+
+    room_event_cache.refresh_unread_counts().await.unwrap();
+
+    assert_eq!(room.num_unread_messages(), 0);
 }
