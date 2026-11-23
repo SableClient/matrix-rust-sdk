@@ -245,7 +245,7 @@ impl UtdHookManager {
         trace!(%event_id, "UtdHookManager: Observed UTD");
         // Hold the lock on `reported_utds` throughout, to avoid races with
         // other threads.
-        let mut reported_utds_lock = self.reported_utds.lock().await;
+        let reported_utds_lock = self.reported_utds.lock().await;
 
         // Check if this, or a previous instance of UtdHookManager, has already
         // reported this UTD, and bail out if not.
@@ -289,7 +289,7 @@ impl UtdHookManager {
 
         let Some(max_delay) = self.max_delay else {
             // No delay: immediately report the event to the parent hook.
-            Self::report_utd(info, &self.parent, &self.client, &mut reported_utds_lock).await;
+            Self::report_utd(info, &self.parent, &self.client, reported_utds_lock).await;
             return;
         };
 
@@ -311,19 +311,14 @@ impl UtdHookManager {
             // another call to `on_utd` (which could otherwise see that the
             // entry has been removed from `pending_delayed` but not yet added
             // to `reported_utds`).
-            let mut reported_utds_lock = reported_utds.lock().await;
+            let reported_utds_lock = reported_utds.lock().await;
 
             // Remove the task from the outstanding set. But if it's already
             // been removed, it's been decrypted since the task was added!
             let pending_report = pending_delayed.lock().unwrap().remove(&owned_event_id);
             if let Some(pending_report) = pending_report {
-                Self::report_utd(
-                    pending_report.utd_info,
-                    &parent,
-                    &client,
-                    &mut reported_utds_lock,
-                )
-                .await;
+                Self::report_utd(pending_report.utd_info, &parent, &client, reported_utds_lock)
+                    .await;
             }
         });
 
@@ -343,7 +338,7 @@ impl UtdHookManager {
         trace!(%event_id, "UtdHookManager: On late decrypt");
         // Hold the lock on `reported_utds` throughout, to avoid races with
         // other threads.
-        let mut reported_utds_lock = self.reported_utds.lock().await;
+        let reported_utds_lock = self.reported_utds.lock().await;
 
         // Only let the parent hook know about the late decryption if the event
         // is a pending UTD. If so, remove the event from the pending list —
@@ -359,7 +354,7 @@ impl UtdHookManager {
         // Update the UTD Info struct with new data, then report it
         let mut info = pending_utd_report.utd_info;
         info.time_to_decrypt = Some(pending_utd_report.marked_utd_at.elapsed());
-        Self::report_utd(info, &self.parent, &self.client, &mut reported_utds_lock).await;
+        Self::report_utd(info, &self.parent, &self.client, reported_utds_lock).await;
     }
 
     /// Helper for [`UtdHookManager::on_utd`] and
@@ -367,19 +362,24 @@ impl UtdHookManager {
     /// and records the event as reported.
     ///
     /// Must be called with the lock held on [`UtdHookManager::reported_utds`],
-    /// and takes a `MutexGuard` to enforce that.
+    /// and takes a `MutexGuard` to enforce that. The lock is released before
+    /// persisting the data, which may have to wait for the client to resume.
     async fn report_utd(
         info: UnableToDecryptInfo,
         parent_hook: &Arc<dyn UnableToDecryptHook>,
         client: &Client,
-        reported_utds_lock: &mut MutexGuard<'_, GrowableBloom>,
+        mut reported_utds_lock: MutexGuard<'_, GrowableBloom>,
     ) {
         let event_id = info.event_id.clone();
         parent_hook.on_utd(info);
         reported_utds_lock.insert(event_id);
 
-        // The stores are closed while the client is paused.
+        // The stores are closed while the client is paused. Don't block the
+        // other reports meanwhile, and persist the latest data once resumed.
+        let reported_utds = MutexGuard::mutex(&reported_utds_lock);
+        drop(reported_utds_lock);
         client.wait_until_resumed().await;
+        let reported_utds_lock = reported_utds.lock().await;
 
         if let Err(e) = client
             .state_store()
@@ -600,6 +600,49 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[async_test]
+    async fn test_reporting_does_not_block_while_paused() {
+        let client = no_retry_test_client(None).await;
+        let hook = Arc::new(Dummy::default());
+        let wrapper = Arc::new(UtdHookManager::new(hook.clone(), client.clone()));
+
+        client.pause().await.unwrap();
+
+        let sender = user_id!("@a:b");
+        let timestamp = MilliSecondsSinceUnixEpoch::now();
+        let first = spawn({
+            let wrapper = wrapper.clone();
+            async move { wrapper.on_utd(event_id!("$1"), UtdCause::Unknown, timestamp, sender).await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(!first.is_finished());
+
+        // The first report waits for the resume to persist its data, the parent
+        // hook is still told about the next one.
+        let second = spawn({
+            let wrapper = wrapper.clone();
+            async move { wrapper.on_utd(event_id!("$2"), UtdCause::Unknown, timestamp, sender).await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(hook.utds.lock().unwrap().len(), 2);
+
+        client.resume().await.unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        // Both reports are persisted.
+        let data = client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::UtdHookManagerData)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_utd_hook_manager_data()
+            .unwrap();
+        assert!(data.contains(event_id!("$1")));
+        assert!(data.contains(event_id!("$2")));
     }
 
     /// Test that UTD events which had not yet been reported in a previous
