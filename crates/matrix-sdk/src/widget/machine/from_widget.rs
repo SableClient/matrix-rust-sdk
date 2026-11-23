@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use as_variant::as_variant;
 #[cfg(feature = "unstable-msc4354")]
-use ruma::api::client::delayed_events::send_delayed_event;
+use ruma::api::client::delayed_events::schedule_delayed_event;
 use ruma::{
     OwnedEventId, OwnedRoomId,
     api::{
@@ -276,8 +276,8 @@ impl From<delayed_state_event::msc4140::Response> for SendEventResponse {
 }
 
 #[cfg(feature = "unstable-msc4354")]
-impl From<send_delayed_event::msc4140::Response> for SendEventResponse {
-    fn from(val: send_delayed_event::msc4140::Response) -> Self {
+impl From<schedule_delayed_event::v3::Response> for SendEventResponse {
+    fn from(val: schedule_delayed_event::v3::Response) -> Self {
         SendEventResponse { room_id: None, event_id: None, delay_id: Some(val.delay_id) }
     }
 }

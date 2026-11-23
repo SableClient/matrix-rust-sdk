@@ -35,7 +35,7 @@ use ruma::events::{StateEventContent, StateEventType};
 use ruma::{
     OwnedTransactionId, TransactionId,
     api::client::{
-        delayed_events::send_delayed_event, message::send_message_event, state::send_state_event,
+        delayed_events::schedule_delayed_event, message::send_message_event, state::send_state_event,
     },
     assign,
     events::{AnyMessageLikeEventContent, AnyStateEventContent, MessageLikeEventContent},
@@ -345,7 +345,7 @@ impl<'a> SendDelayedRawMessageLikeEvent<'a> {
 }
 
 impl<'a> IntoFuture for SendDelayedRawMessageLikeEvent<'a> {
-    type Output = Result<send_delayed_event::msc4140::Response>;
+    type Output = Result<schedule_delayed_event::v3::Response>;
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
@@ -368,14 +368,14 @@ impl<'a> IntoFuture for SendDelayedRawMessageLikeEvent<'a> {
             let PreparedMessageLikeEvent { txn_id, event_type, content, encryption_info: _ } =
                 prepare_message_like_event(room, event_type, content, transaction_id).await?;
 
-            let request = send_delayed_event::msc4140::Request::new_raw(
+            let request = schedule_delayed_event::v3::Request::new_raw(
                 event_type.into(),
                 room.room_id().to_owned(),
                 txn_id,
                 delay,
                 None,
                 content.cast(),
-            )?;
+            );
             #[cfg(feature = "unstable-msc4354")]
             let request = assign!(request, { sticky_duration_ms: sticky_duration });
 
@@ -683,7 +683,7 @@ impl<'a> SendDelayedRawStateEvent<'a> {
 }
 
 impl<'a> IntoFuture for SendDelayedRawStateEvent<'a> {
-    type Output = Result<send_delayed_event::msc4140::Response>;
+    type Output = Result<schedule_delayed_event::v3::Response>;
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
@@ -697,14 +697,14 @@ impl<'a> IntoFuture for SendDelayedRawStateEvent<'a> {
             let PreparedStateEvent { event_type, state_key, content } =
                 prepare_state_event(room, event_type, state_key, content).await?;
 
-            let request = send_delayed_event::msc4140::Request::new_raw(
+            let request = schedule_delayed_event::v3::Request::new_raw(
                 event_type.into(),
                 room.room_id().to_owned(),
                 TransactionId::new(),
                 delay,
                 Some(state_key),
                 content.cast(),
-            )?;
+            );
 
             let response = room.client.send(request).with_request_config(request_config).await?;
 
