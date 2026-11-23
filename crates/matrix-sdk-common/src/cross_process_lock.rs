@@ -518,7 +518,9 @@ where
     /// Undo [`CrossProcessLock::suspend`].
     ///
     /// Call this once the store is open again. Guards that outlived the
-    /// suspension get their lease back and renewed.
+    /// suspension get their lease back and renewed. If that isn't possible,
+    /// the lock is marked as dirty, as another holder may have taken it in the
+    /// meantime.
     pub async fn resume(&self) {
         if let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config {
             let _attempt = self.locking_attempt.lock().await;
@@ -528,8 +530,12 @@ where
                     Ok(Ok(())) => {}
                     Ok(Err(unobtained)) => {
                         warn!("Couldn't take the lock back after resuming: {unobtained}");
+                        self.inner.is_dirty.store(true, Ordering::SeqCst);
                     }
-                    Err(err) => warn!("Couldn't take the lock back after resuming: {err:#}"),
+                    Err(err) => {
+                        warn!("Couldn't take the lock back after resuming: {err:#}");
+                        self.inner.is_dirty.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }
@@ -1334,7 +1340,7 @@ mod tests {
         drop(guard);
 
         // Acquiring doesn't wait for a `resume` that will never come.
-        timeout(Duration::from_secs(1), lock.try_lock_once())
+        let _guard = timeout(Duration::from_secs(1), lock.try_lock_once())
             .await
             .expect("locking must not wait")
             .unwrap()
@@ -1373,6 +1379,62 @@ mod tests {
             .await
             .expect("suspending must complete once the guards are released")
             .unwrap();
+    }
+
+    #[async_test]
+    async fn test_resume_marks_a_surviving_guard_dirty_if_the_lock_was_taken() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store.clone(),
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+        let guard =
+            lock.try_lock_once().await.unwrap().expect("lock must be obtained").into_guard();
+
+        // The guard outlives the suspension.
+        lock.suspend().await;
+
+        // Another holder takes the lock and keeps it.
+        let other = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("second"),
+        );
+        let _other_guard =
+            other.try_lock_once().await.unwrap().expect("lock must be obtained").into_guard();
+
+        lock.resume().await;
+
+        assert!(guard.is_dirty());
+        assert!(lock.is_dirty());
+    }
+
+    #[async_test]
+    async fn test_resume_marks_a_surviving_guard_dirty_if_the_lock_changed_holder() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store.clone(),
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+        let guard =
+            lock.try_lock_once().await.unwrap().expect("lock must be obtained").into_guard();
+
+        lock.suspend().await;
+
+        // Another holder takes the lock, then releases it.
+        let other = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("second"),
+        );
+        drop(other.try_lock_once().await.unwrap().expect("lock must be obtained"));
+        sleep(Duration::from_millis(2 * u64::from(LEASE_DURATION_MS))).await;
+
+        lock.resume().await;
+
+        assert!(guard.is_dirty());
     }
 
     #[async_test]
