@@ -299,6 +299,21 @@ pub const EXTEND_LEASE_EVERY_MS: u64 = 50;
 /// release the lock.
 const SUSPEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Undoes [`CrossProcessLock::suspend`] when dropped while armed, i.e. when
+/// the `suspend` future is dropped before it completes.
+struct SuspendRollback<'a> {
+    inner: &'a CrossProcessLockInner,
+    armed: bool,
+}
+
+impl Drop for SuspendRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.suspended.send_replace(false);
+        }
+    }
+}
+
 /// Initial backoff, in milliseconds. This is the time we wait the first time,
 /// if taking the lock initially failed.
 const INITIAL_BACKOFF_MS: u32 = 10;
@@ -445,6 +460,11 @@ where
     pub async fn suspend(&self) {
         self.inner.suspended.send_replace(true);
 
+        // If this future is dropped before the lock is released in the store,
+        // don't leave the acquisitions waiting for a `resume` that may never
+        // come.
+        let mut rollback = SuspendRollback { inner: &self.inner, armed: true };
+
         if timeout(
             async {
                 while Self::count_holders(&self.inner) > 0 {
@@ -463,6 +483,9 @@ where
 
         // Dropping the task aborts it.
         let renew_task = self.inner.renew_task.lock().await.take();
+
+        // The lease isn't renewed anymore, there is no way back but `resume`.
+        rollback.armed = false;
 
         if renew_task.is_some()
             && let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config
@@ -852,7 +875,11 @@ mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test_macros::async_test;
     use strass::assert_let;
-    use tokio::{spawn, task::yield_now, time::sleep};
+    use tokio::{
+        spawn,
+        task::yield_now,
+        time::{sleep, timeout},
+    };
 
     use super::{
         CrossProcessLockConfig, CrossProcessLockError, CrossProcessLockGeneration,
@@ -1272,6 +1299,29 @@ mod tests {
         lock.resume().await;
 
         let _guard = waiting.await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_dropping_suspend_rolls_it_back() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+        let guard = lock.try_lock_once().await.unwrap().expect("lock must be obtained");
+
+        // The suspension is waiting for the guard to be released when it's
+        // dropped.
+        assert!(timeout(Duration::from_millis(100), lock.suspend()).await.is_err());
+        drop(guard);
+
+        // Acquiring doesn't wait for a `resume` that will never come.
+        timeout(Duration::from_secs(1), lock.try_lock_once())
+            .await
+            .expect("locking must not wait")
+            .unwrap()
+            .expect("lock must be obtained");
     }
 
     #[async_test]
