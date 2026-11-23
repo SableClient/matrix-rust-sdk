@@ -19,7 +19,7 @@ use matrix_sdk_base::{
         StoredThreadSubscription, ThreadSubscriptionStatus, migration_helpers::RoomInfoV1,
     },
 };
-use matrix_sdk_store_encryption::StoreCipher;
+use matrix_sdk_store_encryption::{EncryptedValue, StoreCipher};
 use ruma::{
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
@@ -586,11 +586,30 @@ impl SqliteStateStore {
 
     /// Custom values written before they were encrypted are still stored as
     /// is.
-    fn decode_custom_value(&self, value: Vec<u8>) -> Vec<u8> {
-        match self.decode_value(&value) {
-            Ok(decoded) => decoded.into_owned(),
-            Err(_) => value,
+    ///
+    /// Only a value that isn't in the encrypted format is taken for such a
+    /// legacy value. A value in the encrypted format that can't be decrypted,
+    /// e.g. because it is corrupted or because of the wrong key, is an error.
+    fn decode_custom_value(&self, value: Vec<u8>) -> Result<Vec<u8>> {
+        let Some(cipher) = self.get_cypher() else {
+            return Ok(value);
+        };
+
+        match rmp_serde::from_slice::<EncryptedValue>(&value) {
+            Ok(encrypted) => Ok(cipher.decrypt_value_data(encrypted)?),
+            Err(_) => {
+                warn!("Reading a custom value that isn't encrypted, it will be once it is set");
+                Ok(value)
+            }
         }
+    }
+
+    /// Decode the value that was just replaced or removed. If it can't be
+    /// decoded, it is discarded: the caller doesn't depend on it.
+    fn decode_previous_custom_value(&self, value: Vec<u8>) -> Option<Vec<u8>> {
+        self.decode_custom_value(value)
+            .inspect_err(|error| warn!("Discarding a custom value that can't be decoded: {error}"))
+            .ok()
     }
 
     fn encode_custom_key(&self, key: &[u8]) -> Key {
@@ -2181,7 +2200,7 @@ impl StateStore for SqliteStateStore {
 
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let value = self.read().await?.get_kv_blob(self.encode_custom_key(key)).await?;
-        Ok(value.map(|value| self.decode_custom_value(value)))
+        Ok(value.map(|value| self.decode_custom_value(value)).transpose()?)
     }
 
     async fn set_custom_value_no_read(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
@@ -2196,7 +2215,7 @@ impl StateStore for SqliteStateStore {
         let key = self.encode_custom_key(key);
         let previous = conn.get_kv_blob(key.clone()).await?;
         conn.set_kv_blob(key, self.encode_value(value)?).await?;
-        Ok(previous.map(|value| self.decode_custom_value(value)))
+        Ok(previous.and_then(|value| self.decode_previous_custom_value(value)))
     }
 
     async fn remove_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -2206,7 +2225,7 @@ impl StateStore for SqliteStateStore {
         if previous.is_some() {
             conn.delete_kv_blob(key).await?;
         }
-        Ok(previous.map(|value| self.decode_custom_value(value)))
+        Ok(previous.and_then(|value| self.decode_previous_custom_value(value)))
     }
 
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
@@ -2970,6 +2989,46 @@ mod encrypted_tests {
         let values: Vec<Vec<u8>> =
             statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
         assert!(!values.iter().any(|value| value.windows(12).any(|w| w == b"secret value")));
+    }
+
+    #[async_test]
+    async fn test_custom_values_that_cannot_be_decrypted_are_errors() {
+        let path = new_state_store_workspace();
+        let store = SqliteStateStore::open(&path, Some("default_test_password")).await.unwrap();
+        store.set_custom_value_no_read(b"key", b"secret value".to_vec()).await.unwrap();
+
+        // Corrupt the ciphertext, keeping the encrypted format.
+        let conn = store.write().await.unwrap();
+        let stored = conn.get_kv_blob(store.encode_custom_key(b"key")).await.unwrap().unwrap();
+        let mut corrupted = stored.clone();
+        // Skip the msgpack header, the ciphertext is the first binary field.
+        corrupted[30] ^= 0xff;
+        conn.set_kv_blob(store.encode_custom_key(b"key"), corrupted).await.unwrap();
+        drop(conn);
+
+        // The corrupted ciphertext isn't returned as the value.
+        store.get_custom_value(b"key").await.unwrap_err();
+
+        // It can still be overwritten.
+        assert_eq!(store.set_custom_value(b"key", b"new".to_vec()).await.unwrap(), None);
+        assert_eq!(store.get_custom_value(b"key").await.unwrap().as_deref(), Some(&b"new"[..]));
+
+        // A value encrypted with another key isn't returned either.
+        let other_path = new_state_store_workspace();
+        let other = SqliteStateStore::open(&other_path, Some("another_password")).await.unwrap();
+        other.set_custom_value_no_read(b"key", b"other value".to_vec()).await.unwrap();
+        let foreign = other
+            .read()
+            .await
+            .unwrap()
+            .get_kv_blob(other.encode_custom_key(b"key"))
+            .await
+            .unwrap()
+            .unwrap();
+        let conn = store.write().await.unwrap();
+        conn.set_kv_blob(store.encode_custom_key(b"key"), foreign).await.unwrap();
+        drop(conn);
+        store.get_custom_value(b"key").await.unwrap_err();
     }
 
     /// The two passphrase methods are interchangeable in both directions.
