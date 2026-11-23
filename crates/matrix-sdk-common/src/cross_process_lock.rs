@@ -297,7 +297,10 @@ pub const EXTEND_LEASE_EVERY_MS: u64 = 50;
 
 /// How long [`CrossProcessLock::suspend`] waits for the current holders to
 /// release the lock.
-const SUSPEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// This is on the critical path of the app being moved to the background, so
+/// it has to stay short.
+const SUSPEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Undoes [`CrossProcessLock::suspend`] when dropped while armed, i.e. when
 /// the `suspend` future is dropped before it completes.
@@ -400,7 +403,9 @@ where
     pub async fn try_lock_once(&self) -> AcquireCrossProcessLockResult<L::LockError> {
         // If it's not `MultiProcess`, this behaves as a no-op
         let CrossProcessLockConfig::MultiProcess { holder_name } = &self.config else {
-            self.wait_until_resumed().await;
+            if self.must_wait_for_resume() {
+                self.wait_until_resumed().await;
+            }
             let guard = CrossProcessLockGuard::new(&self.inner);
             return Ok(Ok(CrossProcessLockState::Clean(guard)));
         };
@@ -408,11 +413,13 @@ where
         // Hold onto the locking attempt mutex for the entire lifetime of this
         // function, to avoid multiple reentrant calls.
         let mut _attempt = loop {
-            self.wait_until_resumed().await;
+            if self.must_wait_for_resume() {
+                self.wait_until_resumed().await;
+            }
             let attempt = self.locking_attempt.lock().await;
 
             // `suspend` may have run between the wait and the mutex.
-            if !*self.inner.suspended.borrow() {
+            if !self.must_wait_for_resume() {
                 break attempt;
             }
         };
@@ -444,6 +451,16 @@ where
         } else {
             CrossProcessLockState::Clean(guard)
         }))
+    }
+
+    /// Whether acquiring the lock has to wait for [`CrossProcessLock::resume`].
+    ///
+    /// While suspended, an existing holder can still hand out new guards: that
+    /// doesn't reach the store, and making it wait would deadlock with
+    /// [`CrossProcessLock::suspend`] waiting for that holder to release the
+    /// lock.
+    fn must_wait_for_resume(&self) -> bool {
+        *self.inner.suspended.borrow() && Self::count_holders(&self.inner) == 0
     }
 
     async fn wait_until_resumed(&self) {
@@ -1322,6 +1339,40 @@ mod tests {
             .expect("locking must not wait")
             .unwrap()
             .expect("lock must be obtained");
+    }
+
+    #[async_test]
+    async fn test_holder_can_acquire_again_while_suspending() {
+        let store = ClosableStore::default();
+        let lock = super::CrossProcessLock::new(
+            store,
+            "key".to_owned(),
+            CrossProcessLockConfig::multi_process("first"),
+        );
+        let guard = lock.try_lock_once().await.unwrap().expect("lock must be obtained");
+
+        let suspending = spawn({
+            let lock = lock.clone();
+            async move { lock.suspend().await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        assert!(suspending.is_finished().not());
+
+        // The nested acquisition doesn't wait for the suspension, which would
+        // wait for the holder to release the lock.
+        let nested = timeout(Duration::from_millis(500), lock.try_lock_once())
+            .await
+            .expect("a holder must be able to take the lock again")
+            .unwrap()
+            .expect("lock must be obtained");
+
+        drop(guard);
+        drop(nested);
+
+        timeout(Duration::from_millis(500), suspending)
+            .await
+            .expect("suspending must complete once the guards are released")
+            .unwrap();
     }
 
     #[async_test]
