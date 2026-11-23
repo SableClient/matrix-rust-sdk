@@ -1736,6 +1736,51 @@ async fn test_client_pause_defers_store_lock_acquisition() {
 }
 
 #[async_test]
+#[cfg(feature = "sqlite")]
+async fn test_client_failed_resume_does_not_leave_lock_waiters_hanging() {
+    let tempdir = tempdir().unwrap();
+    let store_path = tempdir.path().join("stores");
+    std::fs::create_dir(&store_path).unwrap();
+
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .sqlite_store(&store_path, None)
+                .cross_process_store_config(CrossProcessLockConfig::multi_process("test"))
+        })
+        .build()
+        .await;
+
+    drop(client.event_cache_store().lock().await.unwrap());
+
+    client.pause().await.unwrap();
+
+    let waiting = spawn({
+        let client = client.clone();
+        async move { client.event_cache_store().lock().await.map(drop) }
+    });
+
+    // The stores can't be reopened, e.g. because their location is gone.
+    let moved_path = tempdir.path().join("moved");
+    std::fs::rename(&store_path, &moved_path).unwrap();
+    client.resume().await.unwrap_err();
+
+    // The lock acquisition fails instead of waiting for ever.
+    timeout(Duration::from_secs(3), waiting)
+        .await
+        .expect("locking must not wait after a failed resume")
+        .unwrap()
+        .unwrap_err();
+
+    // Resuming again once the stores are reachable recovers the client.
+    std::fs::rename(&moved_path, &store_path).unwrap();
+    client.resume().await.unwrap();
+    drop(client.event_cache_store().lock().await.unwrap());
+}
+
+#[async_test]
 async fn test_logout() {
     let server = MatrixMockServer::new().await;
 

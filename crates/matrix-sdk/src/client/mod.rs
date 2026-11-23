@@ -4489,13 +4489,16 @@ impl Client {
         info!("Client::resume — re-acquiring database resources");
 
         // Reopen stores (creates new connection pools).
-        self.base_client().reopen_stores().await?;
-
-        self.base_client().resume_locks().await;
-        #[cfg(feature = "e2e-encryption")]
-        if let Some(lock) = self.locks().cross_process_crypto_store_lock.get() {
-            lock.resume().await;
+        if let Err(err) = self.base_client().reopen_stores().await {
+            // Don't leave the lock acquisitions waiting for a resume that
+            // failed: they will reach the stores, and fail. Calling
+            // `resume` again reopens the stores and takes the locks
+            // back.
+            self.resume_locks().await;
+            return Err(err.into());
         }
+
+        self.resume_locks().await;
 
         self.inner.paused.send_replace(false);
 
@@ -4504,6 +4507,16 @@ impl Client {
 
         info!("Client::resume — complete");
         Ok(())
+    }
+
+    /// Let the cross-process locks be acquired again, see
+    /// [`Client::pause()`].
+    async fn resume_locks(&self) {
+        self.base_client().resume_locks().await;
+        #[cfg(feature = "e2e-encryption")]
+        if let Some(lock) = self.locks().cross_process_crypto_store_lock.get() {
+            lock.resume().await;
+        }
     }
 
     /// Wait until the client is not paused, see [`Client::pause()`].
