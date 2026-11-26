@@ -226,7 +226,7 @@ impl Caches {
                         room.weak_room().to_owned(),
                         &self.internals.state,
                         self.internals.auto_shrink_sender.clone(),
-                        room.update_sender().generic_update_sender().clone(),
+                        room.update_sender().clone(),
                         self.internals.linked_chunk_update_sender.clone(),
                     )
                     .await?;

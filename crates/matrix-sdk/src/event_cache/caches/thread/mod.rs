@@ -31,7 +31,7 @@ use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, events::relation::RelationType,
     room_version_rules::RoomVersionRules,
 };
-use tokio::sync::{Notify, broadcast::Sender, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tracing::{instrument, trace};
 
 pub(in super::super) use self::state::ThreadEventCacheState;
@@ -46,7 +46,7 @@ use super::{
     },
     EventsOrigin, TimelineVectorDiffs,
     read_receipts::MaybeReceiptEventContent,
-    room::RoomEventCacheGenericUpdate,
+    room::{RoomEventCacheGenericUpdate, RoomEventCacheUpdateSender},
     subscriber::{AutoShrinkMessage, Subscriber},
 };
 use crate::{event_cache::caches::room::LinkedChunkUpdateSender, room::WeakRoom};
@@ -84,6 +84,10 @@ struct ThreadEventCacheInner {
 
     /// Update sender for this thread.
     update_sender: ThreadEventCacheUpdateSender,
+
+    /// Update sender of the room this thread belongs to, to announce a new
+    /// [`ThreadSummary`] for the thread root.
+    room_update_sender: RoomEventCacheUpdateSender,
 }
 
 impl fmt::Debug for ThreadEventCache {
@@ -103,9 +107,10 @@ impl ThreadEventCache {
         weak_room: WeakRoom,
         state: &StateLock,
         auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
-        generic_update_sender: Sender<RoomEventCacheGenericUpdate>,
+        room_update_sender: RoomEventCacheUpdateSender,
         linked_chunk_update_sender: LinkedChunkUpdateSender,
     ) -> Result<Self> {
+        let generic_update_sender = room_update_sender.generic_update_sender().clone();
         let update_sender = ThreadEventCacheUpdateSender::new(generic_update_sender.clone());
 
         // Computed while building the state: nothing may await once the state
@@ -146,6 +151,7 @@ impl ThreadEventCache {
                 pagination_batch_token_notifier: Notify::new(),
                 auto_shrink_sender,
                 update_sender,
+                room_update_sender,
             }),
         };
 

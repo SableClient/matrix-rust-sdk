@@ -141,6 +141,57 @@ async fn test_thread_contains_its_root_event() {
 }
 
 #[async_test]
+async fn test_paginated_replies_update_the_thread_summary() {
+    // The thread root arrives by sync before it has replies, and its replies
+    // are only loaded by paginating the thread: the summary must count them.
+
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let thread_root_id = event_id!("$thread_root");
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("Thread root").event_id(thread_root_id)),
+        )
+        .await;
+
+    let event_cache = client.event_cache().unwrap();
+    let (room_event_cache, _room_drop_handles) = event_cache.room(room_id).await.unwrap();
+    let (_, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+    let (thread_event_cache, _drop_handles) =
+        event_cache.thread(room_id, thread_root_id).await.unwrap();
+
+    server
+        .mock_room_relations()
+        .match_target_event(thread_root_id.to_owned())
+        .ok(RoomRelationsResponseTemplate::default().events(vec![
+            f.text_msg("a reply")
+                .in_thread(thread_root_id, thread_root_id)
+                .event_id(event_id!("$reply"))
+                .into_raw_timeline(),
+        ]))
+        .mock_once()
+        .mount()
+        .await;
+
+    thread_event_cache.pagination().run_backwards_once(42).await.unwrap();
+
+    loop {
+        assert_let_timeout!(Ok(update) = room_stream.recv());
+        if let RoomEventCacheUpdate::UpdateThreadSummary { thread_root, thread_summary } = update {
+            assert_eq!(thread_root, thread_root_id);
+            assert_eq!(thread_summary.num_replies, 1);
+            break;
+        }
+    }
+}
+
+#[async_test]
 async fn test_ignored_user_empties_threads() {
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;

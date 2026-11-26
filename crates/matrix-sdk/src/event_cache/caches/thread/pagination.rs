@@ -32,7 +32,7 @@ use super::{
             BackPaginationOutcome, LoadMoreEventsBackwardsOutcome, PaginatedCache, Pagination,
             SharedPaginationStatus,
         },
-        room::RoomEventCacheGenericUpdate,
+        room::{RoomEventCacheGenericUpdate, RoomEventCacheUpdate},
     },
     ThreadEventCacheInner,
     updates::ThreadEventCacheUpdate,
@@ -423,6 +423,24 @@ impl PaginatedCache for ThreadEventCacheWrapper {
                     diffs: timeline_event_diffs,
                     origin: EventsOrigin::Pagination,
                 }),
+                Some(RoomEventCacheGenericUpdate { room_id: state.room_id.clone() }),
+            );
+        }
+
+        // Replies loaded from `/relations` are only counted here: sync
+        // recounts the replies it brings, not the ones paginated.
+        if topo_ordered_events.iter().any(|event| event.event_id() != Some(&*self.cache.thread_id))
+        {
+            let thread_summary = state.update_thread_summary().await?;
+
+            state
+                .update_sender
+                .send(ThreadEventCacheUpdate::UpdateSummary(thread_summary.clone()), None);
+            self.cache.room_update_sender.send(
+                RoomEventCacheUpdate::UpdateThreadSummary {
+                    thread_root: self.cache.thread_id.clone(),
+                    thread_summary,
+                },
                 Some(RoomEventCacheGenericUpdate { room_id: state.room_id.clone() }),
             );
         }
