@@ -2567,14 +2567,25 @@ impl Room {
         self.enable_encryption_inner(true).await
     }
 
+    /// Do the work an encrypted send would otherwise wait on: sync the
+    /// members, query their keys and share a room key with their devices.
+    ///
+    /// Call it when the user starts typing so the next send goes out
+    /// without that round trip. Does nothing if the room is not encrypted.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn prepare_to_encrypt(&self) -> Result<()> {
+        if !self.latest_encryption_state().await?.is_encrypted() {
+            return Ok(());
+        }
+        futures::ensure_room_encryption_ready(self).await
+    }
+
     /// Share a room key with users in the given room.
     ///
     /// This will create Olm sessions with all the users/device pairs in the
     /// room if necessary and share a room key that can be shared with them.
     ///
     /// Does nothing if no room key needs to be shared.
-    // TODO: expose this publicly so people can pre-share a group session if
-    // e.g. a user starts to type a message for a room.
     #[cfg(feature = "e2e-encryption")]
     #[instrument(skip_all, fields(room_id = ?self.room_id()))]
     async fn preshare_room_key(&self) -> Result<()> {

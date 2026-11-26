@@ -822,7 +822,7 @@ impl<'a> IntoFuture for SendStateEvent<'a> {
 
 /// Ensures the room is ready for encrypted events to be sent.
 #[cfg(feature = "e2e-encryption")]
-async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
+pub(super) async fn ensure_room_encryption_ready(room: &Room) -> Result<()> {
     if !room.are_members_synced() {
         room.sync_members().await?;
     }
